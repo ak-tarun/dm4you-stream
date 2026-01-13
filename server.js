@@ -1,6 +1,6 @@
 /**
  * StreamFlow Secure Streaming Gateway
- * Production-grade video proxy with Transcoding, Security, and Stream Management.
+ * Production-grade video proxy with Range Support, FFmpeg Remuxing, and Token Handling.
  */
 
 const express = require('express');
@@ -15,168 +15,167 @@ const url = require('url');
 const app = express();
 const PORT = 4000;
 
-// 1. SECURITY HARDENING
-app.use(helmet()); // Sets various HTTP headers for security
-app.use(cors({
-    origin: '*', // In production, replace with specific domain allow-list
-    methods: ['GET', 'HEAD', 'OPTIONS'],
-    exposedHeaders: ['Content-Length', 'Content-Range', 'Content-Type']
+// 1. SECURITY & PERFORMANCE HEADERS
+app.use(helmet({
+    contentSecurityPolicy: false, // Allow blob: and data: sources for video
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: { policy: "cross-origin" } // CRITICAL for video playback
 }));
 
-// Rate Limiting: Prevent abuse
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'HEAD', 'OPTIONS'],
+    allowedHeaders: ['Range', 'Authorization', 'Content-Type'],
+    exposedHeaders: ['Content-Length', 'Content-Range', 'Content-Type', 'Accept-Ranges']
+}));
+
+// Rate Limiting
 const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // Limit each IP to 100 requests per windowMs
-    message: 'Too many requests from this IP, please try again later.'
+    windowMs: 15 * 60 * 1000,
+    max: 500, // Higher limit for video segments
+    message: 'Too many requests.'
 });
 app.use('/proxy', limiter);
 
-// 2. STREAM FORMAT NORMALIZATION & UTILS
 const getProtocol = (link) => link.startsWith('https') ? https : http;
 
-const isValidUrl = (string) => {
-    try {
-        new URL(string);
-        return true;
-    } catch (_) {
-        return false;
-    }
-};
-
-const isYouTube = (link) => {
-    return link.includes('youtube.com') || link.includes('youtu.be');
-};
-
-// 3. CORE PROXY LOGIC
+// 2. SMART PROXY ENGINE
 app.get('/proxy', async (req, res) => {
     const videoUrl = req.query.url;
-    const forceTranscode = req.query.transcode === 'true';
+    // Auto-transcode if container is not browser friendly
+    const needsTranscode = req.query.transcode === 'true' || 
+                           videoUrl.match(/\.(mkv|avi|flv|wmv)$/i);
 
-    // Validation
-    if (!videoUrl || !isValidUrl(videoUrl)) {
-        return res.status(400).json({ error: 'Invalid or missing URL parameter' });
-    }
+    if (!videoUrl) return res.status(400).send('Missing URL');
 
-    // YouTube Handling: The Gateway refuses to proxy YouTube raw streams (TOS violation/Breaking changes).
-    // It tells the frontend to use the IFrame API.
-    if (isYouTube(videoUrl)) {
-        return res.status(400).json({ 
-            error: 'YouTube detected', 
-            code: 'USE_YOUTUBE_API',
-            message: 'This secure gateway does not proxy YouTube. Use the Client IFrame integration.'
+    // -- PATH A: FFmpeg Remuxing (Transcoding) --
+    // Used for MKV, AVI, or when atom placement is bad.
+    // Converts to Fragmented MP4 (fMP4) which is streamable.
+    if (needsTranscode) {
+        console.log(`⚙️ [Transcode] Remuxing: ${videoUrl}`);
+        
+        res.writeHead(200, {
+            'Content-Type': 'video/mp4',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*'
         });
+
+        const ffmpegCommand = ffmpeg(videoUrl)
+            .inputOptions([
+                '-re',
+                '-headers', `User-Agent: ${req.headers['user-agent'] || 'Mozilla/5.0'}`
+            ])
+            .outputOptions([
+                '-movflags frag_keyframe+empty_moov+default_base_moof', // KEY: Makes it streamable immediately
+                '-c:v copy', // Zero-copy video if codec supported
+                '-c:a aac',  // Ensure audio is AAC
+                '-f mp4'
+            ])
+            .on('error', (err) => {
+                // FFmpeg errors are expected when client disconnects
+                if (err.message !== 'Output stream closed') {
+                    console.error('❌ [Transcode] Error:', err.message);
+                }
+            })
+            .pipe(res, { end: true });
+        
+        req.on('close', () => {
+            ffmpegCommand.kill('SIGKILL');
+        });
+        return;
     }
 
-    console.log(`\n🎬 [Gateway] Processing: ${videoUrl}`);
-
+    // -- PATH B: Native Range Proxy --
+    // Used for MP4, WebM. Critical for Mobile/Safari seeking.
     try {
         const parsedUrl = url.parse(videoUrl);
         const protocol = getProtocol(videoUrl);
-
-        // Headers Forwarding (User-Agent spoofing for compatibility)
+        
+        // 1. Forward Client Headers (Range is vital)
         const headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Referer': `${parsedUrl.protocol}//${parsedUrl.hostname}/`,
-            ...req.headers
+            'Accept': '*/*',
+            'Connection': 'keep-alive',
+            'Referer': `${parsedUrl.protocol}//${parsedUrl.hostname}/`
         };
-        
-        // Remove host header to avoid confusion
-        delete headers['host'];
-        
-        // 4. TRANSCODING PATH (FFmpeg)
-        // If the source is an unsupported format (e.g., AVI, MKV) or requested to transcode
-        if (forceTranscode || videoUrl.endsWith('.mkv') || videoUrl.endsWith('.avi')) {
-            console.log('⚙️  [Transcoder] Remuxing stream to Fragmented MP4...');
-            
-            res.writeHead(200, {
-                'Content-Type': 'video/mp4',
-                'Connection': 'keep-alive',
-                'Access-Control-Allow-Origin': '*'
-            });
 
-            const command = ffmpeg(videoUrl)
-                .inputOptions([
-                    '-re', // Read input at native framerate
-                    '-headers', `User-Agent: ${headers['User-Agent']}`
-                ])
-                .outputOptions([
-                    '-movflags frag_keyframe+empty_moov', // Fragmented MP4 for streaming
-                    '-c:v copy', // Try to copy video codec (fast)
-                    '-c:a aac', // Ensure audio is AAC (browser compatible)
-                    '-f mp4'
-                ])
-                .on('error', (err) => {
-                    console.error('❌ [Transcoder] Error:', err.message);
-                    if (!res.headersSent) res.status(500).end();
-                })
-                .pipe(res, { end: true });
-            
-            return;
+        if (req.headers.range) {
+            headers['Range'] = req.headers.range;
         }
 
-        // 5. DIRECT STREAMING PATH (Zero-copy pipe)
-        const proxyReq = protocol.request({
-            host: parsedUrl.hostname,
+        const options = {
+            hostname: parsedUrl.hostname,
             port: parsedUrl.port,
             path: parsedUrl.path,
             method: 'GET',
-            headers: headers
-        }, (proxyRes) => {
-            
-            // Handle Redirects
+            headers: headers,
+            rejectUnauthorized: false // Handle self-signed certs on private CDNs
+        };
+
+        const proxyReq = protocol.request(options, (proxyRes) => {
+            // Handle Redirects Manually (to keep Range headers)
             if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
-                console.log(`🔄 [Gateway] Following redirect -> ${proxyRes.headers.location}`);
+                console.log(`🔄 [Redirect] ${proxyRes.headers.location}`);
                 res.redirect(307, `/proxy?url=${encodeURIComponent(proxyRes.headers.location)}`);
                 return;
             }
 
-            // Pipe Headers
-            const forwardHeaders = [
-                'content-type', 'content-length', 'content-range', 
-                'accept-ranges', 'cache-control', 'last-modified'
-            ];
-            
-            forwardHeaders.forEach(h => {
-                if (proxyRes.headers[h]) res.setHeader(h, proxyRes.headers[h]);
-            });
-
-            res.setHeader('Access-Control-Allow-Origin', '*');
+            // Forward Status Code (200 vs 206)
             res.status(proxyRes.statusCode);
 
-            // Pipe Data
+            // Forward Critical Headers
+            const safeHeaders = [
+                'content-type', 
+                'content-length', 
+                'content-range', 
+                'accept-ranges', 
+                'last-modified', 
+                'etag'
+            ];
+            
+            safeHeaders.forEach(headerName => {
+                if (proxyRes.headers[headerName]) {
+                    res.setHeader(headerName, proxyRes.headers[headerName]);
+                }
+            });
+
+            // Force browser to treat this as streamable video
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+
+            // Pipe data
             proxyRes.pipe(res);
 
-            proxyRes.on('error', (err) => {
-                console.error('❌ [Stream] Source Error:', err.message);
+            proxyRes.on('error', (e) => {
+                console.error('Stream source error', e);
                 res.end();
             });
         });
 
-        proxyReq.on('error', (err) => {
-            console.error('❌ [Stream] Request Error:', err.message);
-            if (!res.headersSent) res.status(502).json({ error: 'Bad Gateway' });
+        proxyReq.on('error', (e) => {
+            console.error('Request error', e);
+            if (!res.headersSent) res.status(502).send('Bad Gateway');
         });
 
-        proxyReq.on('timeout', () => {
-            console.error('⏱️ [Stream] Timeout');
+        // Abort upstream request if client disconnects (Save Bandwidth)
+        req.on('close', () => {
             proxyReq.destroy();
         });
 
         proxyReq.end();
 
-    } catch (error) {
-        console.error('❌ [Gateway] Critical Error:', error);
-        res.status(500).send('Internal Server Error');
+    } catch (err) {
+        console.error('Proxy Exception', err);
+        res.status(500).send('Proxy Error');
     }
 });
 
 app.listen(PORT, () => {
     console.log(`
 ╔════════════════════════════════════════════════════════╗
-║   🛡️  StreamFlow Secure Gateway Active                 ║
-║   🚀  Running on: http://localhost:${PORT}               ║
-║   📹  Endpoint: /proxy?url=...                         ║
-║   🔐  Features: Rate Limit, CORS, FFmpeg, HLS/Dash     ║
+║   🛡️  StreamFlow Smart Gateway Active                  ║
+║   🚀  http://localhost:${PORT}                           ║
+║   ✨  Features: HTTP 206 Range, fMP4 Remuxing          ║
 ╚════════════════════════════════════════════════════════╝
     `);
 });

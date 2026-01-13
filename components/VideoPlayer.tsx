@@ -51,7 +51,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
   // --- Initialization & Source Handling ---
 
   useEffect(() => {
-    // Reset State
+    // Reset State on source change
     setState(prev => ({ 
         ...prev, 
         playing: autoPlay, 
@@ -63,6 +63,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     }));
     setQualities([]);
     setIsYoutubeMode(false);
+    retryCount.current = 0;
     
     const mimeType = source.type || detectMimeType(source.src);
 
@@ -70,7 +71,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     if (mimeType === 'youtube') {
         setIsYoutubeMode(true);
         setState(prev => ({ ...prev, buffering: false }));
-        return; // Stop standard initialization
+        return; 
     }
 
     const video = videoRef.current;
@@ -87,9 +88,14 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     }
 
     // Determine Final URL (Apply Proxy if set)
-    const finalUrl = source.proxyUrl 
+    // IMPORTANT: If transcode is needed (AVI/MKV), append query param
+    let finalUrl = source.proxyUrl 
         ? `${source.proxyUrl}?url=${encodeURIComponent(source.src)}` 
         : source.src;
+    
+    if (mimeType === 'video/x-matroska' || mimeType === 'video/x-msvideo') {
+       if (source.proxyUrl) finalUrl += '&transcode=true';
+    }
     
     const savedTime = getFromStorage(STORAGE_TIME_KEY, 0);
 
@@ -146,12 +152,13 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
                    break;
                  default:
                    hls.destroy();
-                   setState(s => ({ ...s, error: "Stream error. Ensure CORS/Headers are correct." }));
+                   setState(s => ({ ...s, error: "HLS Stream error. Ensure CORS/Headers are correct." }));
                    break;
                }
              }
           });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          // Native HLS (Safari)
           video.src = finalUrl;
           video.addEventListener('loadedmetadata', () => {
              if (savedTime > 0) video.currentTime = savedTime;
@@ -220,7 +227,10 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         });
         
         dash.on(dashjs.MediaPlayer.events.ERROR as string, (e: any) => {
-            setState(s => ({...s, error: `Playback Error: ${e.error.message}`}));
+             // Silently handle manifest loading errors if possible, or show error
+             if (e.error === 'download') {
+                 setState(s => ({...s, error: `Connection failed.`}));
+             }
         });
 
       } catch (err) {
@@ -233,7 +243,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     } else if (mimeType === 'application/dash+xml') {
       initDash();
     } else {
-      // MP4 / Native
+      // MP4 / Native / FMP4
       video.src = finalUrl;
       video.load();
       const handleMetadata = () => {
@@ -266,7 +276,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         currentTime: video.currentTime,
         buffered: video.buffered.length > 0 ? video.buffered.end(video.buffered.length - 1) : 0
       }));
-      // Save progress every 5 seconds roughly
       if (Math.floor(video.currentTime) % 5 === 0) {
         saveToStorage(STORAGE_TIME_KEY, video.currentTime);
       }
@@ -276,9 +285,19 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     
     const onError = (e: Event) => {
         const target = e.target as HTMLVideoElement;
+        // Don't show error immediately on network glitch, try to reload once
+        if (retryCount.current < 1 && target.error?.code === MediaError.MEDIA_ERR_NETWORK) {
+            retryCount.current++;
+            console.log("Network error, retrying...");
+            target.load();
+            if (state.currentTime > 0) target.currentTime = state.currentTime;
+            target.play();
+            return;
+        }
+
         setState(s => ({ 
             ...s, 
-            error: getFriendlyErrorMessage(target.error, "Playback prevented. Try using the secure gateway.") 
+            error: getFriendlyErrorMessage(target.error, "Stream prevented by browser security. Ensure Gateway is active.") 
         }));
     };
 
@@ -304,7 +323,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
   // --- Control Handlers ---
 
   const togglePlay = useCallback(() => {
-    if (isYoutubeMode) return; // YouTube iframe handles its own controls
+    if (isYoutubeMode) return;
     const video = videoRef.current;
     if (!video) return;
     if (video.paused) {
@@ -397,7 +416,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
 
   // --- Interaction Observers ---
 
-  // Mouse Move / Hide Controls
   const handleMouseMove = () => {
     setShowControls(true);
     if (controlTimeout) clearTimeout(controlTimeout);
@@ -407,7 +425,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     setControlTimeout(timeout);
   };
   
-  // Mobile double-tap zones logic
   const handleZoneClick = (side: 'left' | 'right') => (e: React.MouseEvent) => {
       if (isYoutubeMode) return;
       e.stopPropagation();
@@ -456,34 +473,32 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         ref={videoRef}
         className="w-full h-full object-contain cursor-pointer"
         playsInline
+        webkit-playsinline="true"
         crossOrigin="anonymous"
       />
 
-      {/* Buffering Indicator */}
       {state.buffering && !state.error && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none bg-black/20 z-10">
           <Loader2 className="w-16 h-16 text-red-600 animate-spin" />
         </div>
       )}
 
-      {/* Error Message */}
       {state.error && (
         <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-auto bg-black/90 z-30 text-white p-6 text-center">
           <AlertTriangle className="w-12 h-12 text-red-500 mb-4" />
-          <h3 className="text-xl font-bold mb-2">Stream Error</h3>
+          <h3 className="text-xl font-bold mb-2">Playback Failed</h3>
           <p className="text-gray-300 max-w-md mb-6">{state.error}</p>
           <div className="flex gap-4">
             <button 
                 onClick={() => window.location.reload()} 
                 className="bg-white/10 hover:bg-white/20 px-4 py-2 rounded text-sm transition-colors"
             >
-                Retry Playback
+                Reload Player
             </button>
           </div>
         </div>
       )}
 
-      {/* Big Play Button (Initial or Paused) */}
       {!state.playing && !state.buffering && !state.error && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none bg-black/10 z-10">
            <div className="w-20 h-20 bg-red-600/90 rounded-full flex items-center justify-center pl-2 shadow-lg scale-100 transition-transform hover:scale-110">
@@ -492,7 +507,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         </div>
       )}
 
-      {/* Double Tap Animations */}
       {doubleTapAction === 'forward' && (
           <div className="absolute right-10 top-1/2 -translate-y-1/2 bg-black/50 rounded-full p-4 animate-ping z-20">
              <Forward className="w-8 h-8 text-white" />
@@ -504,7 +518,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
           </div>
       )}
 
-      {/* Double Tap Touch Zones (Mobile) */}
       <div 
          className="absolute top-0 left-0 w-1/4 h-3/4 z-20 opacity-0 md:hidden" 
          onClick={handleZoneClick('left')}
@@ -514,7 +527,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
          onClick={handleZoneClick('right')}
       />
 
-      {/* Controls */}
       <ControlBar 
         state={state}
         showControls={showControls || !state.playing}

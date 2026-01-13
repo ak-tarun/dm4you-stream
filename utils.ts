@@ -29,10 +29,22 @@ export const getFromStorage = <T>(key: string, defaultValue: T): T => {
 };
 
 export const detectMimeType = (url: string): string => {
-  if (url.includes('.m3u8')) return 'application/x-mpegURL';
-  if (url.includes('.mpd')) return 'application/dash+xml';
-  if (url.includes('youtube.com') || url.includes('youtu.be')) return 'youtube';
-  return 'video/mp4'; // Default fallback
+  const lowerUrl = url.toLowerCase();
+  
+  // Manifest based streaming
+  if (lowerUrl.includes('.m3u8')) return 'application/x-mpegURL';
+  if (lowerUrl.includes('.mpd')) return 'application/dash+xml';
+  
+  // Specific Providers
+  if (lowerUrl.includes('youtube.com') || lowerUrl.includes('youtu.be')) return 'youtube';
+  
+  // Generic containers
+  if (lowerUrl.includes('.webm')) return 'video/webm';
+  if (lowerUrl.includes('.mkv')) return 'video/x-matroska'; // Will trigger transcode
+  if (lowerUrl.includes('.avi')) return 'video/x-msvideo';  // Will trigger transcode
+  
+  // Default to MP4 for everything else (signed URLs often lack extension)
+  return 'video/mp4'; 
 };
 
 export const getYouTubeId = (url: string): string | null => {
@@ -47,13 +59,13 @@ export const getFriendlyErrorMessage = (error: MediaError | null, nativeError?: 
 
   switch (error.code) {
     case MediaError.MEDIA_ERR_ABORTED:
-      return "The video playback was aborted.";
+      return "Playback aborted by user.";
     case MediaError.MEDIA_ERR_NETWORK:
-      return "A network error caused the video download to fail part-way.";
+      return "Network error. The stream connection was lost.";
     case MediaError.MEDIA_ERR_DECODE:
-      return "The video playback was aborted due to a corruption problem or because the video used features your browser did not support.";
+      return "The video file is corrupted or uses an unsupported codec.";
     case MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED:
-      return "The video could not be loaded, either because the server or network failed or because the format is not supported.";
+      return "The format is not supported by this browser or the link is expired.";
     default:
       return "An unknown error occurred.";
   }
