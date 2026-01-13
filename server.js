@@ -1,6 +1,6 @@
 /**
  * StreamFlow Secure Streaming Gateway
- * Production-grade video proxy with Range Support, FFmpeg Remuxing, and Token Handling.
+ * Advanced Proxy with Internal Redirect Following, Range Support, and FFmpeg Transcoding.
  */
 
 const express = require('express');
@@ -17,9 +17,9 @@ const PORT = 4000;
 
 // 1. SECURITY & PERFORMANCE HEADERS
 app.use(helmet({
-    contentSecurityPolicy: false, // Allow blob: and data: sources for video
+    contentSecurityPolicy: false,
     crossOriginEmbedderPolicy: false,
-    crossOriginResourcePolicy: { policy: "cross-origin" } // CRITICAL for video playback
+    crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 
 app.use(cors({
@@ -32,25 +32,25 @@ app.use(cors({
 // Rate Limiting
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 500, // Higher limit for video segments
+    max: 1000, // High limit for chunked video requests
     message: 'Too many requests.'
 });
 app.use('/proxy', limiter);
 
+// Helper to get protocol module
 const getProtocol = (link) => link.startsWith('https') ? https : http;
 
-// 2. SMART PROXY ENGINE
+// 2. CORE PROXY ROUTE
 app.get('/proxy', async (req, res) => {
     const videoUrl = req.query.url;
-    // Auto-transcode if container is not browser friendly
-    const needsTranscode = req.query.transcode === 'true' || 
-                           videoUrl.match(/\.(mkv|avi|flv|wmv)$/i);
-
+    
     if (!videoUrl) return res.status(400).send('Missing URL');
 
     // -- PATH A: FFmpeg Remuxing (Transcoding) --
-    // Used for MKV, AVI, or when atom placement is bad.
-    // Converts to Fragmented MP4 (fMP4) which is streamable.
+    // Triggered explicitly or by file extension
+    const needsTranscode = req.query.transcode === 'true' || 
+                           videoUrl.match(/\.(mkv|avi|flv|wmv)$/i);
+
     if (needsTranscode) {
         console.log(`⚙️ [Transcode] Remuxing: ${videoUrl}`);
         
@@ -66,13 +66,12 @@ app.get('/proxy', async (req, res) => {
                 '-headers', `User-Agent: ${req.headers['user-agent'] || 'Mozilla/5.0'}`
             ])
             .outputOptions([
-                '-movflags frag_keyframe+empty_moov+default_base_moof', // KEY: Makes it streamable immediately
-                '-c:v copy', // Zero-copy video if codec supported
-                '-c:a aac',  // Ensure audio is AAC
+                '-movflags frag_keyframe+empty_moov+default_base_moof',
+                '-c:v copy', 
+                '-c:a aac',
                 '-f mp4'
             ])
             .on('error', (err) => {
-                // FFmpeg errors are expected when client disconnects
                 if (err.message !== 'Output stream closed') {
                     console.error('❌ [Transcode] Error:', err.message);
                 }
@@ -85,97 +84,107 @@ app.get('/proxy', async (req, res) => {
         return;
     }
 
-    // -- PATH B: Native Range Proxy --
-    // Used for MP4, WebM. Critical for Mobile/Safari seeking.
-    try {
-        const parsedUrl = url.parse(videoUrl);
-        const protocol = getProtocol(videoUrl);
-        
-        // 1. Forward Client Headers (Range is vital)
+    // -- PATH B: Advanced Native Proxy (Internal Redirects) --
+    // This function recursively follows redirects on the server side
+    // to prevent CORS/Protocol issues on the client.
+    const proxyStream = (targetUrl, attempt = 0) => {
+        if (attempt > 10) {
+            console.error('❌ Too many redirects');
+            if (!res.headersSent) res.status(502).send('Too many redirects');
+            return;
+        }
+
+        const parsedUrl = url.parse(targetUrl);
+        const protocol = getProtocol(targetUrl);
+
         const headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': '*/*',
+            'Accept-Encoding': 'identity', // Important: Disable gzip for video
             'Connection': 'keep-alive',
             'Referer': `${parsedUrl.protocol}//${parsedUrl.hostname}/`
         };
 
+        // Forward Range header from client to upstream
         if (req.headers.range) {
             headers['Range'] = req.headers.range;
         }
 
-        const options = {
+        const proxyReq = protocol.request({
             hostname: parsedUrl.hostname,
             port: parsedUrl.port,
             path: parsedUrl.path,
             method: 'GET',
             headers: headers,
-            rejectUnauthorized: false // Handle self-signed certs on private CDNs
-        };
-
-        const proxyReq = protocol.request(options, (proxyRes) => {
-            // Handle Redirects Manually (to keep Range headers)
+            rejectUnauthorized: false // Allow self-signed certs
+        }, (proxyRes) => {
+            // Handle Redirects Internally
             if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
-                console.log(`🔄 [Redirect] ${proxyRes.headers.location}`);
-                res.redirect(307, `/proxy?url=${encodeURIComponent(proxyRes.headers.location)}`);
+                let redirectUrl = proxyRes.headers.location;
+                if (redirectUrl.startsWith('/')) {
+                    redirectUrl = `${parsedUrl.protocol}//${parsedUrl.hostname}${redirectUrl}`;
+                }
+                console.log(`🔄 [Redirect ${attempt + 1}] -> ${redirectUrl}`);
+                // Recurse
+                proxyStream(redirectUrl, attempt + 1);
                 return;
             }
 
-            // Forward Status Code (200 vs 206)
-            res.status(proxyRes.statusCode);
+            // Check for valid status
+            if (!res.headersSent) {
+                // Forward specific headers to client
+                const responseHeaders = {
+                    'Content-Type': proxyRes.headers['content-type'] || 'video/mp4',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Range',
+                    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
+                    'Cache-Control': 'no-cache'
+                };
 
-            // Forward Critical Headers
-            const safeHeaders = [
-                'content-type', 
-                'content-length', 
-                'content-range', 
-                'accept-ranges', 
-                'last-modified', 
-                'etag'
-            ];
-            
-            safeHeaders.forEach(headerName => {
-                if (proxyRes.headers[headerName]) {
-                    res.setHeader(headerName, proxyRes.headers[headerName]);
-                }
-            });
+                if (proxyRes.headers['content-length']) responseHeaders['Content-Length'] = proxyRes.headers['content-length'];
+                if (proxyRes.headers['content-range']) responseHeaders['Content-Range'] = proxyRes.headers['content-range'];
+                if (proxyRes.headers['accept-ranges']) responseHeaders['Accept-Ranges'] = proxyRes.headers['accept-ranges'];
 
-            // Force browser to treat this as streamable video
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+                res.writeHead(proxyRes.statusCode, responseHeaders);
+            }
 
             // Pipe data
             proxyRes.pipe(res);
-
-            proxyRes.on('error', (e) => {
-                console.error('Stream source error', e);
+            
+            proxyRes.on('error', (err) => {
+                console.error('Stream Error:', err.message);
                 res.end();
             });
         });
 
-        proxyReq.on('error', (e) => {
-            console.error('Request error', e);
-            if (!res.headersSent) res.status(502).send('Bad Gateway');
+        proxyReq.on('error', (err) => {
+            console.error('Request Error:', err.message);
+            if (!res.headersSent) res.status(500).send('Stream Error');
         });
 
-        // Abort upstream request if client disconnects (Save Bandwidth)
+        proxyReq.on('timeout', () => {
+            proxyReq.destroy();
+            if (!res.headersSent) res.status(504).send('Timeout');
+        });
+
+        // Cleanup on client disconnect
         req.on('close', () => {
             proxyReq.destroy();
         });
 
         proxyReq.end();
+    };
 
-    } catch (err) {
-        console.error('Proxy Exception', err);
-        res.status(500).send('Proxy Error');
-    }
+    console.log(`🎬 [Proxy] ${videoUrl}`);
+    proxyStream(videoUrl);
 });
 
 app.listen(PORT, () => {
     console.log(`
 ╔════════════════════════════════════════════════════════╗
-║   🛡️  StreamFlow Smart Gateway Active                  ║
+║   🛡️  StreamFlow Advanced Gateway Active               ║
 ║   🚀  http://localhost:${PORT}                           ║
-║   ✨  Features: HTTP 206 Range, fMP4 Remuxing          ║
+║   ✨  Modes: Internal Redirects, FFmpeg, Range Proxy   ║
 ╚════════════════════════════════════════════════════════╝
     `);
 });

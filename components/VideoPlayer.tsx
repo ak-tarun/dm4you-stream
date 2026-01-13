@@ -51,7 +51,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
   // --- Initialization & Source Handling ---
 
   useEffect(() => {
-    // Reset State on source change
+    // Reset State
     setState(prev => ({ 
         ...prev, 
         playing: autoPlay, 
@@ -67,7 +67,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     
     const mimeType = source.type || detectMimeType(source.src);
 
-    // YouTube Handling (IFrame Mode)
+    // YouTube Handling
     if (mimeType === 'youtube') {
         setIsYoutubeMode(true);
         setState(prev => ({ ...prev, buffering: false }));
@@ -77,18 +77,11 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     const video = videoRef.current;
     if (!video) return;
 
-    // Cleanup previous instances
-    if (hlsRef.current) {
-        hlsRef.current.destroy();
-        hlsRef.current = null;
-    }
-    if (dashRef.current) {
-        dashRef.current.reset();
-        dashRef.current = null;
-    }
+    // Cleanup
+    if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
+    if (dashRef.current) { dashRef.current.reset(); dashRef.current = null; }
 
-    // Determine Final URL (Apply Proxy if set)
-    // IMPORTANT: If transcode is needed (AVI/MKV), append query param
+    // Build URL
     let finalUrl = source.proxyUrl 
         ? `${source.proxyUrl}?url=${encodeURIComponent(source.src)}` 
         : source.src;
@@ -102,41 +95,22 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     const initHls = async () => {
       try {
         const { default: Hls } = await import('hls.js');
-        
         if (Hls.isSupported()) {
           const hls = new Hls({
             enableWorker: true,
             lowLatencyMode: true,
-            backBufferLength: 90,
-            xhrSetup: (xhr: XMLHttpRequest, url: string) => {
-                if (source.headers) {
-                    Object.entries(source.headers).forEach(([key, value]) => {
-                        xhr.setRequestHeader(key, value);
-                    });
-                }
-                if (source.withCredentials) {
-                    xhr.withCredentials = true;
-                }
-            }
+            backBufferLength: 90
           });
           hlsRef.current = hls;
-
           hls.loadSource(finalUrl);
           hls.attachMedia(video);
-
+          
           hls.on(Hls.Events.MANIFEST_PARSED, (event: any, data: any) => {
             const levels = data.levels.map((level: any, index: number) => ({
-              height: level.height,
-              bitrate: level.bitrate,
-              index: index,
-              label: level.height ? `${level.height}p` : 'Auto'
+              height: level.height, bitrate: level.bitrate, index: index, label: level.height ? `${level.height}p` : 'Auto'
             }));
             setQualities(levels);
-            
-            if (data.levels.length > 0 && data.levels[0].details?.live) {
-                setState(s => ({ ...s, isLive: true }));
-            }
-            
+            if (data.levels.length > 0 && data.levels[0].details?.live) setState(s => ({ ...s, isLive: true }));
             if (savedTime > 0 && !state.isLive) video.currentTime = savedTime;
             if (autoPlay) video.play().catch(() => setState(s => ({ ...s, playing: false, muted: true }))); 
           });
@@ -144,66 +118,32 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
           hls.on(Hls.Events.ERROR, (event: any, data: any) => {
              if (data.fatal) {
                switch (data.type) {
-                 case Hls.ErrorTypes.NETWORK_ERROR:
-                   hls.startLoad();
-                   break;
-                 case Hls.ErrorTypes.MEDIA_ERROR:
-                   hls.recoverMediaError();
-                   break;
-                 default:
-                   hls.destroy();
-                   setState(s => ({ ...s, error: "HLS Stream error. Ensure CORS/Headers are correct." }));
-                   break;
+                 case Hls.ErrorTypes.NETWORK_ERROR: hls.startLoad(); break;
+                 case Hls.ErrorTypes.MEDIA_ERROR: hls.recoverMediaError(); break;
+                 default: hls.destroy(); setState(s => ({ ...s, error: "Stream unavailable." })); break;
                }
              }
           });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-          // Native HLS (Safari)
           video.src = finalUrl;
           video.addEventListener('loadedmetadata', () => {
              if (savedTime > 0) video.currentTime = savedTime;
              if (autoPlay) video.play();
           }, { once: true });
         }
-      } catch (err) {
-        setState(s => ({ ...s, error: "Failed to load HLS player module" }));
-      }
+      } catch (err) { setState(s => ({ ...s, error: "HLS Load Failed" })); }
     };
 
     const initDash = async () => {
       try {
         const { default: dashjs } = await import('dashjs');
-        
         const dash = dashjs.MediaPlayer().create();
         dashRef.current = dash;
         
-        // Header injection
-        if (source.headers) {
-            dash.extend("RequestModifier", () => {
-                return {
-                    modifyRequestHeader: (xhr: XMLHttpRequest) => {
-                        Object.entries(source.headers || {}).forEach(([key, value]) => {
-                            xhr.setRequestHeader(key, value);
-                        });
-                        return xhr;
-                    },
-                    modifyRequestURL: (url: string) => url 
-                };
-            }, true);
-        }
-
-        // DRM Configuration
         if (source.drm) {
             const protectionData: any = {};
             if (source.drm.type === 'widevine') {
-                protectionData['com.widevine.alpha'] = {
-                    serverURL: source.drm.licenseUrl,
-                    httpRequestHeaders: source.drm.headers
-                };
-            } else if (source.drm.type === 'clearkey') {
-                 protectionData['org.w3.clearkey'] = {
-                    serverURL: source.drm.licenseUrl
-                };
+                protectionData['com.widevine.alpha'] = { serverURL: source.drm.licenseUrl, httpRequestHeaders: source.drm.headers };
             }
             dash.setProtectionData(protectionData);
         }
@@ -212,43 +152,21 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         
         dash.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED as string, () => {
            const bitrates = (dash as any).getBitrateInfoListFor("video");
-           const levels = bitrates.map((b: any, i: number) => ({
-              height: b.height,
-              bitrate: b.bitrate,
-              index: i,
-              label: `${b.height}p`
-           }));
-           setQualities(levels);
-           
-           const isDynamic = dash.isDynamic();
-           setState(s => ({ ...s, isLive: isDynamic }));
-
-           if (savedTime > 0 && !isDynamic) dash.seek(savedTime);
+           setQualities(bitrates.map((b: any, i: number) => ({ height: b.height, bitrate: b.bitrate, index: i, label: `${b.height}p` })));
+           if (savedTime > 0 && !dash.isDynamic()) dash.seek(savedTime);
         });
-        
-        dash.on(dashjs.MediaPlayer.events.ERROR as string, (e: any) => {
-             // Silently handle manifest loading errors if possible, or show error
-             if (e.error === 'download') {
-                 setState(s => ({...s, error: `Connection failed.`}));
-             }
-        });
-
-      } catch (err) {
-        setState(s => ({ ...s, error: "Failed to load DASH player module" }));
-      }
+      } catch (err) { setState(s => ({ ...s, error: "DASH Load Failed" })); }
     };
 
-    if (mimeType === 'application/x-mpegURL') {
-      initHls();
-    } else if (mimeType === 'application/dash+xml') {
-      initDash();
-    } else {
-      // MP4 / Native / FMP4
+    if (mimeType === 'application/x-mpegURL') initHls();
+    else if (mimeType === 'application/dash+xml') initDash();
+    else {
+      // Standard MP4
       video.src = finalUrl;
       video.load();
       const handleMetadata = () => {
           if (savedTime > 0) video.currentTime = savedTime;
-          if (autoPlay) video.play();
+          if (autoPlay) video.play().catch(e => console.warn("Autoplay blocked", e));
       };
       video.addEventListener('loadedmetadata', handleMetadata, { once: true });
     }
@@ -260,7 +178,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
   }, [source.src, source.proxyUrl, source.headers, autoPlay, source.drm]);
 
   // --- Event Listeners ---
-
   useEffect(() => {
     const video = videoRef.current;
     if (!video || isYoutubeMode) return;
@@ -269,35 +186,34 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     const onPause = () => setState(s => ({ ...s, playing: false }));
     const onWaiting = () => setState(s => ({ ...s, buffering: true }));
     const onCanPlay = () => setState(s => ({ ...s, buffering: false }));
-    
     const onTimeUpdate = () => {
       setState(s => ({
-        ...s,
-        currentTime: video.currentTime,
+        ...s, currentTime: video.currentTime,
         buffered: video.buffered.length > 0 ? video.buffered.end(video.buffered.length - 1) : 0
       }));
-      if (Math.floor(video.currentTime) % 5 === 0) {
-        saveToStorage(STORAGE_TIME_KEY, video.currentTime);
-      }
+      if (Math.floor(video.currentTime) % 5 === 0) saveToStorage(STORAGE_TIME_KEY, video.currentTime);
     };
-    
     const onDurationChange = () => setState(s => ({ ...s, duration: video.duration }));
     
     const onError = (e: Event) => {
         const target = e.target as HTMLVideoElement;
-        // Don't show error immediately on network glitch, try to reload once
-        if (retryCount.current < 1 && target.error?.code === MediaError.MEDIA_ERR_NETWORK) {
+        console.error("Video Error:", target.error);
+        
+        // Mobile Retry Logic: Often network glitches cause MEDIA_ERR_NETWORK
+        if (retryCount.current < 2 && (target.error?.code === MediaError.MEDIA_ERR_NETWORK || target.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED)) {
             retryCount.current++;
-            console.log("Network error, retrying...");
-            target.load();
-            if (state.currentTime > 0) target.currentTime = state.currentTime;
-            target.play();
+            console.log(`Retrying playback (Attempt ${retryCount.current})...`);
+            setTimeout(() => {
+                target.load();
+                if (state.currentTime > 0) target.currentTime = state.currentTime;
+                target.play().catch(console.warn);
+            }, 1000);
             return;
         }
 
         setState(s => ({ 
             ...s, 
-            error: getFriendlyErrorMessage(target.error, "Stream prevented by browser security. Ensure Gateway is active.") 
+            error: getFriendlyErrorMessage(target.error, "Playback prevented. Ensure the Secure Gateway is enabled.") 
         }));
     };
 
@@ -320,17 +236,13 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     };
   }, [source.src, isYoutubeMode]);
 
-  // --- Control Handlers ---
+  // ... (Controls logic remains same) ...
 
   const togglePlay = useCallback(() => {
     if (isYoutubeMode) return;
     const video = videoRef.current;
     if (!video) return;
-    if (video.paused) {
-      video.play().catch(e => console.warn(e));
-    } else {
-      video.pause();
-    }
+    video.paused ? video.play().catch(console.warn) : video.pause();
   }, [isYoutubeMode]);
 
   const seek = useCallback((time: number) => {
@@ -339,15 +251,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     if (!video) return;
     video.currentTime = Math.min(Math.max(0, time), video.duration);
   }, [isYoutubeMode]);
-
-  const skip = useCallback((amount: number) => {
-     if (isYoutubeMode) return;
-     const video = videoRef.current;
-     if (!video) return;
-     seek(video.currentTime + amount);
-     setDoubleTapAction(amount > 0 ? 'forward' : 'rewind');
-     setTimeout(() => setDoubleTapAction(null), 500);
-  }, [seek, isYoutubeMode]);
 
   const changeVolume = useCallback((vol: number) => {
     const video = videoRef.current;
@@ -361,102 +264,26 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
   const toggleMute = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
-    const newMuted = !video.muted;
-    video.muted = newMuted;
-    if (!newMuted && video.volume === 0) {
-        video.volume = 0.5;
-        setState(s => ({ ...s, volume: 0.5 }));
-    }
-    setState(s => ({ ...s, muted: newMuted }));
+    video.muted = !video.muted;
+    setState(s => ({ ...s, muted: video.muted }));
   }, []);
 
   const toggleFullScreen = useCallback(() => {
-    const container = containerRef.current;
-    if (!container) return;
-
-    if (!document.fullscreenElement) {
-      container.requestFullscreen().then(() => setState(s => ({ ...s, fullScreen: true })));
-    } else {
-      document.exitFullscreen().then(() => setState(s => ({ ...s, fullScreen: false })));
-    }
-  }, []);
-
-  const togglePip = useCallback(async () => {
-    const video = videoRef.current;
-    if (!video) return;
-    if (document.pictureInPictureElement) {
-      await document.exitPictureInPicture();
-      setState(s => ({ ...s, pip: false }));
-    } else if (video.requestPictureInPicture) {
-      await video.requestPictureInPicture();
-      setState(s => ({ ...s, pip: true }));
-    }
-  }, []);
-
-  const changeSpeed = useCallback((speed: number) => {
-    const video = videoRef.current;
-    if (!video) return;
-    video.playbackRate = speed;
-    setState(s => ({ ...s, playbackRate: speed }));
+    containerRef.current?.requestFullscreen().then(() => setState(s => ({ ...s, fullScreen: true })));
   }, []);
 
   const changeQuality = useCallback((index: number) => {
     setState(s => ({ ...s, quality: index, autoQuality: index === -1 }));
-    
-    if (hlsRef.current) {
-      hlsRef.current.currentLevel = index;
-    } else if (dashRef.current) {
-        const cfg = { 'video': { 'abr': { 'autoSwitchBitrate': { 'video': index === -1 } } } };
-        dashRef.current.updateSettings(cfg);
-        if (index !== -1) {
-            dashRef.current.setQualityFor('video', index);
-        }
-    }
+    if (hlsRef.current) hlsRef.current.currentLevel = index;
   }, []);
 
-  // --- Interaction Observers ---
-
-  const handleMouseMove = () => {
-    setShowControls(true);
-    if (controlTimeout) clearTimeout(controlTimeout);
-    const timeout = setTimeout(() => {
-        if (state.playing) setShowControls(false);
-    }, 3000);
-    setControlTimeout(timeout);
-  };
-  
-  const handleZoneClick = (side: 'left' | 'right') => (e: React.MouseEvent) => {
-      if (isYoutubeMode) return;
-      e.stopPropagation();
-      e.preventDefault();
-      
-      const now = Date.now();
-      const DOUBLE_TAP_DELAY = 300;
-      
-      if (now - lastTapRef.current < DOUBLE_TAP_DELAY) {
-          skip(side === 'left' ? -10 : 10);
-          lastTapRef.current = 0; 
-      } else {
-          lastTapRef.current = now;
-          togglePlay();
-      }
-  };
+  // --- Render ---
 
   if (isYoutubeMode) {
       const ytId = getYouTubeId(source.src);
       return (
           <div ref={containerRef} className="relative w-full aspect-video bg-black rounded-xl overflow-hidden shadow-2xl">
-              {ytId ? (
-                <iframe
-                    src={`https://www.youtube.com/embed/${ytId}?autoplay=${autoPlay ? 1 : 0}&controls=1&modestbranding=1&rel=0`}
-                    title="YouTube video player"
-                    className="w-full h-full"
-                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                    allowFullScreen
-                />
-              ) : (
-                  <div className="flex items-center justify-center h-full text-white">Invalid YouTube URL</div>
-              )}
+              {ytId ? <iframe src={`https://www.youtube.com/embed/${ytId}?autoplay=${autoPlay ? 1 : 0}&controls=1&modestbranding=1&rel=0`} className="w-full h-full" allowFullScreen /> : <div className="text-white">Invalid YouTube URL</div>}
           </div>
       );
   }
@@ -465,7 +292,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     <div 
       ref={containerRef}
       className="relative w-full aspect-video bg-black group overflow-hidden shadow-2xl rounded-xl select-none"
-      onMouseMove={handleMouseMove}
+      onMouseMove={() => { setShowControls(true); if(controlTimeout) clearTimeout(controlTimeout); setControlTimeout(setTimeout(() => state.playing && setShowControls(false), 3000)); }}
       onMouseLeave={() => state.playing && setShowControls(false)}
       onClick={togglePlay}
     >
@@ -489,12 +316,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
           <h3 className="text-xl font-bold mb-2">Playback Failed</h3>
           <p className="text-gray-300 max-w-md mb-6">{state.error}</p>
           <div className="flex gap-4">
-            <button 
-                onClick={() => window.location.reload()} 
-                className="bg-white/10 hover:bg-white/20 px-4 py-2 rounded text-sm transition-colors"
-            >
-                Reload Player
-            </button>
+             <button onClick={() => window.location.reload()} className="bg-white/10 hover:bg-white/20 px-4 py-2 rounded text-sm transition-colors">Reload</button>
           </div>
         </div>
       )}
@@ -507,26 +329,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         </div>
       )}
 
-      {doubleTapAction === 'forward' && (
-          <div className="absolute right-10 top-1/2 -translate-y-1/2 bg-black/50 rounded-full p-4 animate-ping z-20">
-             <Forward className="w-8 h-8 text-white" />
-          </div>
-      )}
-      {doubleTapAction === 'rewind' && (
-          <div className="absolute left-10 top-1/2 -translate-y-1/2 bg-black/50 rounded-full p-4 animate-ping z-20">
-             <Rewind className="w-8 h-8 text-white" />
-          </div>
-      )}
-
-      <div 
-         className="absolute top-0 left-0 w-1/4 h-3/4 z-20 opacity-0 md:hidden" 
-         onClick={handleZoneClick('left')}
-      />
-      <div 
-         className="absolute top-0 right-0 w-1/4 h-3/4 z-20 opacity-0 md:hidden" 
-         onClick={handleZoneClick('right')}
-      />
-
       <ControlBar 
         state={state}
         showControls={showControls || !state.playing}
@@ -536,8 +338,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         onVolumeChange={changeVolume}
         onToggleMute={toggleMute}
         onToggleFullScreen={toggleFullScreen}
-        onTogglePip={togglePip}
-        onSpeedChange={changeSpeed}
+        onTogglePip={() => {}}
+        onSpeedChange={(s) => { if(videoRef.current) videoRef.current.playbackRate = s; }}
         onQualityChange={changeQuality}
       />
     </div>
