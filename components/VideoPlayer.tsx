@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { Play, Loader2, Forward, Rewind, AlertTriangle } from 'lucide-react';
+import { Play, Loader2, Forward, Rewind, AlertTriangle, ShieldCheck } from 'lucide-react';
 import ControlBar from './ControlBar';
 import { PlayerState, VideoQuality, VideoSource } from '../types';
 import { getFromStorage, saveToStorage, detectMimeType, getFriendlyErrorMessage, getYouTubeId } from '../utils';
@@ -19,6 +19,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
   
   const lastTapRef = useRef<number>(0);
   const retryCount = useRef<number>(0);
+  
+  // Track if we have already attempted to fallback to proxy
+  const [usingProxy, setUsingProxy] = useState(false);
 
   // Constants
   const STORAGE_VOL_KEY = 'streamflow-volume';
@@ -64,118 +67,179 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     setQualities([]);
     setIsYoutubeMode(false);
     retryCount.current = 0;
+    setUsingProxy(false); // Reset proxy state on new source
     
-    const mimeType = source.type || detectMimeType(source.src);
-
-    // YouTube Handling
-    if (mimeType === 'youtube') {
-        setIsYoutubeMode(true);
-        setState(prev => ({ ...prev, buffering: false }));
-        return; 
-    }
-
-    const video = videoRef.current;
-    if (!video) return;
-
-    // Cleanup
-    if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
-    if (dashRef.current) { dashRef.current.reset(); dashRef.current = null; }
-
-    // Build URL
-    let finalUrl = source.proxyUrl 
-        ? `${source.proxyUrl}?url=${encodeURIComponent(source.src)}` 
-        : source.src;
-    
-    if (mimeType === 'video/x-matroska' || mimeType === 'video/x-msvideo') {
-       if (source.proxyUrl) finalUrl += '&transcode=true';
-    }
-    
-    const savedTime = getFromStorage(STORAGE_TIME_KEY, 0);
-
-    const initHls = async () => {
-      try {
-        const { default: Hls } = await import('hls.js');
-        if (Hls.isSupported()) {
-          const hls = new Hls({
-            enableWorker: true,
-            lowLatencyMode: true,
-            backBufferLength: 90
-          });
-          hlsRef.current = hls;
-          hls.loadSource(finalUrl);
-          hls.attachMedia(video);
-          
-          hls.on(Hls.Events.MANIFEST_PARSED, (event: any, data: any) => {
-            const levels = data.levels.map((level: any, index: number) => ({
-              height: level.height, bitrate: level.bitrate, index: index, label: level.height ? `${level.height}p` : 'Auto'
-            }));
-            setQualities(levels);
-            if (data.levels.length > 0 && data.levels[0].details?.live) setState(s => ({ ...s, isLive: true }));
-            if (savedTime > 0 && !state.isLive) video.currentTime = savedTime;
-            if (autoPlay) video.play().catch(() => setState(s => ({ ...s, playing: false, muted: true }))); 
-          });
-
-          hls.on(Hls.Events.ERROR, (event: any, data: any) => {
-             if (data.fatal) {
-               switch (data.type) {
-                 case Hls.ErrorTypes.NETWORK_ERROR: hls.startLoad(); break;
-                 case Hls.ErrorTypes.MEDIA_ERROR: hls.recoverMediaError(); break;
-                 default: hls.destroy(); setState(s => ({ ...s, error: "Stream unavailable." })); break;
-               }
-             }
-          });
-        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-          video.src = finalUrl;
-          video.addEventListener('loadedmetadata', () => {
-             if (savedTime > 0) video.currentTime = savedTime;
-             if (autoPlay) video.play();
-          }, { once: true });
-        }
-      } catch (err) { setState(s => ({ ...s, error: "HLS Load Failed" })); }
-    };
-
-    const initDash = async () => {
-      try {
-        const { default: dashjs } = await import('dashjs');
-        const dash = dashjs.MediaPlayer().create();
-        dashRef.current = dash;
-        
-        if (source.drm) {
-            const protectionData: any = {};
-            if (source.drm.type === 'widevine') {
-                protectionData['com.widevine.alpha'] = { serverURL: source.drm.licenseUrl, httpRequestHeaders: source.drm.headers };
-            }
-            dash.setProtectionData(protectionData);
-        }
-
-        dash.initialize(video, finalUrl, autoPlay);
-        
-        dash.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED as string, () => {
-           const bitrates = (dash as any).getBitrateInfoListFor("video");
-           setQualities(bitrates.map((b: any, i: number) => ({ height: b.height, bitrate: b.bitrate, index: i, label: `${b.height}p` })));
-           if (savedTime > 0 && !dash.isDynamic()) dash.seek(savedTime);
-        });
-      } catch (err) { setState(s => ({ ...s, error: "DASH Load Failed" })); }
-    };
-
-    if (mimeType === 'application/x-mpegURL') initHls();
-    else if (mimeType === 'application/dash+xml') initDash();
-    else {
-      // Standard MP4
-      video.src = finalUrl;
-      video.load();
-      const handleMetadata = () => {
-          if (savedTime > 0) video.currentTime = savedTime;
-          if (autoPlay) video.play().catch(e => console.warn("Autoplay blocked", e));
-      };
-      video.addEventListener('loadedmetadata', handleMetadata, { once: true });
-    }
+    // Initial Load
+    loadVideo(false);
 
     return () => {
       if (hlsRef.current) hlsRef.current.destroy();
       if (dashRef.current) dashRef.current.reset();
     };
-  }, [source.src, source.proxyUrl, source.headers, autoPlay, source.drm]);
+  }, [source.src, source.proxyUrl]);
+
+  // Logic to load the video, potentially with proxy override
+  const loadVideo = async (forceProxy: boolean) => {
+      const video = videoRef.current;
+      if (!video) return;
+
+      const mimeType = source.type || detectMimeType(source.src);
+
+      // YouTube Handling
+      if (mimeType === 'youtube') {
+          setIsYoutubeMode(true);
+          setState(prev => ({ ...prev, buffering: false }));
+          return; 
+      }
+      setIsYoutubeMode(false);
+
+      // Cleanup previous
+      if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
+      if (dashRef.current) { dashRef.current.reset(); dashRef.current = null; }
+
+      // Determine URL
+      let finalUrl = source.src;
+      
+      // If we are forcing proxy (due to error fallback) or source requires it
+      if (forceProxy && source.proxyUrl) {
+          finalUrl = `${source.proxyUrl}?url=${encodeURIComponent(source.src)}`;
+          // If previous failure was generic, maybe it needs transcode (e.g. MKV)
+          if (mimeType.includes('matroska') || mimeType.includes('avi')) {
+               finalUrl += '&transcode=true';
+          }
+          setUsingProxy(true);
+          console.log("🔄 Switching to Gateway Proxy:", finalUrl);
+      }
+
+      const savedTime = getFromStorage(STORAGE_TIME_KEY, 0);
+
+      const initHls = async () => {
+        try {
+          const { default: Hls } = await import('hls.js');
+          if (Hls.isSupported()) {
+            const hls = new Hls({
+              enableWorker: true,
+              lowLatencyMode: true,
+              backBufferLength: 90
+            });
+            hlsRef.current = hls;
+            hls.loadSource(finalUrl);
+            hls.attachMedia(video);
+            
+            hls.on(Hls.Events.MANIFEST_PARSED, (event: any, data: any) => {
+              const levels = data.levels.map((level: any, index: number) => ({
+                height: level.height, bitrate: level.bitrate, index: index, label: level.height ? `${level.height}p` : 'Auto'
+              }));
+              setQualities(levels);
+              if (data.levels.length > 0 && data.levels[0].details?.live) setState(s => ({ ...s, isLive: true }));
+              if (savedTime > 0 && !state.isLive) video.currentTime = savedTime;
+              if (autoPlay) video.play().catch(() => setState(s => ({ ...s, playing: false, muted: true }))); 
+            });
+
+            hls.on(Hls.Events.ERROR, (event: any, data: any) => {
+               if (data.fatal) {
+                 switch (data.type) {
+                   case Hls.ErrorTypes.NETWORK_ERROR: 
+                     console.log("HLS Network Error, recovering...");
+                     hls.startLoad(); 
+                     break;
+                   case Hls.ErrorTypes.MEDIA_ERROR: 
+                     console.log("HLS Media Error, recovering...");
+                     hls.recoverMediaError(); 
+                     break;
+                   default: 
+                     hls.destroy(); 
+                     handlePlaybackError(new Error("HLS Fatal Error"));
+                     break;
+                 }
+               }
+            });
+          } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            video.src = finalUrl;
+            video.addEventListener('loadedmetadata', () => {
+               if (savedTime > 0) video.currentTime = savedTime;
+               if (autoPlay) video.play();
+            }, { once: true });
+          }
+        } catch (err) { setState(s => ({ ...s, error: "HLS Load Failed" })); }
+      };
+
+      const initDash = async () => {
+        try {
+          const { default: dashjs } = await import('dashjs');
+          const dash = dashjs.MediaPlayer().create();
+          dashRef.current = dash;
+          
+          if (source.drm) {
+              const protectionData: any = {};
+              if (source.drm.type === 'widevine') {
+                  protectionData['com.widevine.alpha'] = { serverURL: source.drm.licenseUrl, httpRequestHeaders: source.drm.headers };
+              }
+              dash.setProtectionData(protectionData);
+          }
+  
+          dash.initialize(video, finalUrl, autoPlay);
+          
+          dash.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED as string, () => {
+             const bitrates = (dash as any).getBitrateInfoListFor("video");
+             setQualities(bitrates.map((b: any, i: number) => ({ height: b.height, bitrate: b.bitrate, index: i, label: `${b.height}p` })));
+             if (savedTime > 0 && !dash.isDynamic()) dash.seek(savedTime);
+          });
+        } catch (err) { setState(s => ({ ...s, error: "DASH Load Failed" })); }
+      };
+
+      if (mimeType === 'application/x-mpegURL') initHls();
+      else if (mimeType === 'application/dash+xml') initDash();
+      else {
+        // Standard MP4
+        video.src = finalUrl;
+        video.load();
+        const handleMetadata = () => {
+            if (savedTime > 0) video.currentTime = savedTime;
+            if (autoPlay) video.play().catch(e => console.warn("Autoplay blocked", e));
+        };
+        video.addEventListener('loadedmetadata', handleMetadata, { once: true });
+      }
+  };
+
+  const handlePlaybackError = (err: any) => {
+      // SMART ROUTING LOGIC:
+      // If we encounter an error (CORS, 403, Format), and we aren't using the proxy yet,
+      // switch to proxy automatically.
+      
+      console.error("Playback Error:", err);
+
+      if (!usingProxy && source.proxyUrl) {
+          console.warn("⚠️ Direct playback failed. Auto-switching to Secure Gateway...");
+          setUsingProxy(true);
+          // Preserve current time if possible (unlikely on load error, but possible on mid-stream fail)
+          const currentTime = videoRef.current?.currentTime || 0;
+          saveToStorage(STORAGE_TIME_KEY, currentTime);
+          
+          // Re-initiate load with forced proxy
+          loadVideo(true);
+          return;
+      }
+
+      // If already using proxy, or no proxy available, try simple retry logic for network blips
+      if (retryCount.current < 2) {
+          retryCount.current++;
+          console.log(`Retrying playback (Attempt ${retryCount.current})...`);
+          setTimeout(() => {
+              if (videoRef.current) {
+                  videoRef.current.load();
+                  videoRef.current.play().catch(() => {});
+              }
+          }, 1500);
+          return;
+      }
+
+      setState(s => ({ 
+          ...s, 
+          error: getFriendlyErrorMessage(videoRef.current?.error, "Playback prevented. The stream may be expired or restricted.") 
+      }));
+  };
+
 
   // --- Event Listeners ---
   useEffect(() => {
@@ -196,24 +260,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     const onDurationChange = () => setState(s => ({ ...s, duration: video.duration }));
     
     const onError = (e: Event) => {
-        const target = e.target as HTMLVideoElement;
-        console.error("Video Error:", target.error);
-        
-        if (retryCount.current < 2 && (target.error?.code === MediaError.MEDIA_ERR_NETWORK || target.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED)) {
-            retryCount.current++;
-            console.log(`Retrying playback (Attempt ${retryCount.current})...`);
-            setTimeout(() => {
-                target.load();
-                if (state.currentTime > 0) target.currentTime = state.currentTime;
-                target.play().catch(console.warn);
-            }, 1000);
-            return;
-        }
-
-        setState(s => ({ 
-            ...s, 
-            error: getFriendlyErrorMessage(target.error, "Playback prevented. Ensure the Secure Gateway is enabled.") 
-        }));
+        handlePlaybackError(e);
     };
 
     video.addEventListener('play', onPlay);
@@ -233,7 +280,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
       video.removeEventListener('durationchange', onDurationChange);
       video.removeEventListener('error', onError);
     };
-  }, [source.src, isYoutubeMode]);
+  }, [source.src, isYoutubeMode, usingProxy]); // Re-bind if proxy state changes
 
   // ... Controls ...
   const togglePlay = useCallback(() => {
@@ -295,11 +342,19 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
       <video
         ref={videoRef}
         className="w-full h-full object-contain cursor-pointer"
-        playsInline
+        playsInline={true}
         webkit-playsinline="true"
-        crossOrigin="anonymous"
+        crossOrigin="anonymous" 
         preload="metadata"
       />
+
+      {/* Gateway Indicator - Shows when Smart Routing is active */}
+      {usingProxy && (
+        <div className="absolute top-4 right-4 z-10 flex items-center space-x-1 bg-green-900/40 backdrop-blur text-green-400 text-xs px-2 py-1 rounded border border-green-500/30">
+            <ShieldCheck className="w-3 h-3" />
+            <span>Secure Gateway</span>
+        </div>
+      )}
 
       {state.buffering && !state.error && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none bg-black/20 z-10">
@@ -313,7 +368,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
           <h3 className="text-xl font-bold mb-2">Playback Failed</h3>
           <p className="text-gray-300 max-w-md mb-6">{state.error}</p>
           <div className="flex gap-4">
-             <button onClick={() => window.location.reload()} className="bg-white/10 hover:bg-white/20 px-4 py-2 rounded text-sm transition-colors">Reload</button>
+             <button onClick={() => window.location.reload()} className="bg-white/10 hover:bg-white/20 px-4 py-2 rounded text-sm transition-colors">Reload Player</button>
           </div>
         </div>
       )}

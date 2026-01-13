@@ -44,7 +44,8 @@ export const detectMimeType = (url: string): string => {
   if (lowerUrl.includes('.avi')) return 'video/x-msvideo';  
   
   // Google User Content (Drive/Photos direct links) often lack extensions but are usually MP4
-  if (lowerUrl.includes('googleusercontent.com')) return 'video/mp4';
+  // We explicitly return video/mp4 to trigger the native player logic
+  if (lowerUrl.includes('googleusercontent.com') || lowerUrl.includes('googlevideo.com')) return 'video/mp4';
 
   // Default to MP4 for everything else
   return 'video/mp4'; 
