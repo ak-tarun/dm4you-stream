@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { Play, Loader2, Forward, Rewind, AlertTriangle, ShieldCheck } from 'lucide-react';
+import { Play, Loader2, Forward, Rewind, AlertTriangle, ShieldCheck, RefreshCw } from 'lucide-react';
 import ControlBar from './ControlBar';
 import { PlayerState, VideoQuality, VideoSource } from '../types';
 import { getFromStorage, saveToStorage, detectMimeType, getFriendlyErrorMessage, getYouTubeId } from '../utils';
@@ -20,8 +20,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
   const lastTapRef = useRef<number>(0);
   const retryCount = useRef<number>(0);
   
-  // Track if we have already attempted to fallback to proxy
+  // Track routing state
   const [usingProxy, setUsingProxy] = useState(false);
+  const [usingFastStart, setUsingFastStart] = useState(false);
 
   // Constants
   const STORAGE_VOL_KEY = 'streamflow-volume';
@@ -48,7 +49,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
   const [qualities, setQualities] = useState<VideoQuality[]>([]);
   const [showControls, setShowControls] = useState(true);
   const [controlTimeout, setControlTimeout] = useState<ReturnType<typeof setTimeout> | null>(null);
-  const [doubleTapAction, setDoubleTapAction] = useState<'forward' | 'rewind' | null>(null);
   const [isYoutubeMode, setIsYoutubeMode] = useState(false);
 
   // --- Initialization & Source Handling ---
@@ -67,10 +67,20 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     setQualities([]);
     setIsYoutubeMode(false);
     retryCount.current = 0;
-    setUsingProxy(false); // Reset proxy state on new source
+    setUsingProxy(false); 
+    setUsingFastStart(false);
     
     // Initial Load
-    loadVideo(false);
+    // Check if source matches patterns that ALWAYS need proxy (e.g., googleusercontent)
+    const needsProxy = source.src.includes('googleusercontent.com') || 
+                       source.src.includes('googlevideo.com');
+    
+    if (needsProxy && source.proxyUrl) {
+        setUsingProxy(true);
+        loadVideo(true, false);
+    } else {
+        loadVideo(false, false);
+    }
 
     return () => {
       if (hlsRef.current) hlsRef.current.destroy();
@@ -78,8 +88,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     };
   }, [source.src, source.proxyUrl]);
 
-  // Logic to load the video, potentially with proxy override
-  const loadVideo = async (forceProxy: boolean) => {
+  // Logic to load the video
+  const loadVideo = async (forceProxy: boolean, forceFastStart: boolean) => {
       const video = videoRef.current;
       if (!video) return;
 
@@ -100,15 +110,15 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
       // Determine URL
       let finalUrl = source.src;
       
-      // If we are forcing proxy (due to error fallback) or source requires it
-      if (forceProxy && source.proxyUrl) {
+      // Construct Proxy URL
+      if ((forceProxy || usingProxy) && source.proxyUrl) {
           finalUrl = `${source.proxyUrl}?url=${encodeURIComponent(source.src)}`;
-          // If previous failure was generic, maybe it needs transcode (e.g. MKV)
-          if (mimeType.includes('matroska') || mimeType.includes('avi')) {
-               finalUrl += '&transcode=true';
+          
+          if (forceFastStart || usingFastStart) {
+              finalUrl += '&transcode=true'; // Triggers FFmpeg remux
+          } else if (mimeType.includes('matroska') || mimeType.includes('avi')) {
+              finalUrl += '&transcode=true';
           }
-          setUsingProxy(true);
-          console.log("🔄 Switching to Gateway Proxy:", finalUrl);
       }
 
       const savedTime = getFromStorage(STORAGE_TIME_KEY, 0);
@@ -140,11 +150,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
                if (data.fatal) {
                  switch (data.type) {
                    case Hls.ErrorTypes.NETWORK_ERROR: 
-                     console.log("HLS Network Error, recovering...");
                      hls.startLoad(); 
                      break;
                    case Hls.ErrorTypes.MEDIA_ERROR: 
-                     console.log("HLS Media Error, recovering...");
                      hls.recoverMediaError(); 
                      break;
                    default: 
@@ -179,7 +187,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
           }
   
           dash.initialize(video, finalUrl, autoPlay);
-          
           dash.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED as string, () => {
              const bitrates = (dash as any).getBitrateInfoListFor("video");
              setQualities(bitrates.map((b: any, i: number) => ({ height: b.height, bitrate: b.bitrate, index: i, label: `${b.height}p` })));
@@ -203,25 +210,27 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
   };
 
   const handlePlaybackError = (err: any) => {
-      // SMART ROUTING LOGIC:
-      // If we encounter an error (CORS, 403, Format), and we aren't using the proxy yet,
-      // switch to proxy automatically.
-      
       console.error("Playback Error:", err);
+      const currentTime = videoRef.current?.currentTime || 0;
+      saveToStorage(STORAGE_TIME_KEY, currentTime);
 
+      // Strategy 1: Switch to Proxy
       if (!usingProxy && source.proxyUrl) {
           console.warn("⚠️ Direct playback failed. Auto-switching to Secure Gateway...");
           setUsingProxy(true);
-          // Preserve current time if possible (unlikely on load error, but possible on mid-stream fail)
-          const currentTime = videoRef.current?.currentTime || 0;
-          saveToStorage(STORAGE_TIME_KEY, currentTime);
-          
-          // Re-initiate load with forced proxy
-          loadVideo(true);
+          loadVideo(true, false);
           return;
       }
 
-      // If already using proxy, or no proxy available, try simple retry logic for network blips
+      // Strategy 2: If Proxy failed, try FastStart Remux (fixes Android MOOV atom issues)
+      if (usingProxy && !usingFastStart && source.proxyUrl) {
+          console.warn("⚠️ Proxy playback failed. Attempting FastStart Remux...");
+          setUsingFastStart(true);
+          loadVideo(true, true);
+          return;
+      }
+
+      // Strategy 3: Retry simple reload
       if (retryCount.current < 2) {
           retryCount.current++;
           console.log(`Retrying playback (Attempt ${retryCount.current})...`);
@@ -280,7 +289,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
       video.removeEventListener('durationchange', onDurationChange);
       video.removeEventListener('error', onError);
     };
-  }, [source.src, isYoutubeMode, usingProxy]); // Re-bind if proxy state changes
+  }, [source.src, isYoutubeMode, usingProxy, usingFastStart]);
 
   // ... Controls ...
   const togglePlay = useCallback(() => {
@@ -348,11 +357,19 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         preload="metadata"
       />
 
-      {/* Gateway Indicator - Shows when Smart Routing is active */}
+      {/* Gateway Indicator */}
       {usingProxy && (
-        <div className="absolute top-4 right-4 z-10 flex items-center space-x-1 bg-green-900/40 backdrop-blur text-green-400 text-xs px-2 py-1 rounded border border-green-500/30">
-            <ShieldCheck className="w-3 h-3" />
-            <span>Secure Gateway</span>
+        <div className="absolute top-4 right-4 z-10 flex flex-col items-end space-y-1">
+            <div className="flex items-center space-x-1 bg-green-900/60 backdrop-blur text-green-400 text-xs px-2 py-1 rounded border border-green-500/30">
+                <ShieldCheck className="w-3 h-3" />
+                <span>Secure Gateway</span>
+            </div>
+            {usingFastStart && (
+                <div className="flex items-center space-x-1 bg-blue-900/60 backdrop-blur text-blue-400 text-xs px-2 py-1 rounded border border-blue-500/30">
+                    <RefreshCw className="w-3 h-3 animate-spin-slow" />
+                    <span>Live Remux</span>
+                </div>
+            )}
         </div>
       )}
 
