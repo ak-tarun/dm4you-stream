@@ -199,7 +199,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         const target = e.target as HTMLVideoElement;
         console.error("Video Error:", target.error);
         
-        // Mobile Retry Logic: Often network glitches cause MEDIA_ERR_NETWORK
         if (retryCount.current < 2 && (target.error?.code === MediaError.MEDIA_ERR_NETWORK || target.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED)) {
             retryCount.current++;
             console.log(`Retrying playback (Attempt ${retryCount.current})...`);
@@ -236,8 +235,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     };
   }, [source.src, isYoutubeMode]);
 
-  // ... (Controls logic remains same) ...
-
+  // ... Controls ...
   const togglePlay = useCallback(() => {
     if (isYoutubeMode) return;
     const video = videoRef.current;
@@ -277,8 +275,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     if (hlsRef.current) hlsRef.current.currentLevel = index;
   }, []);
 
-  // --- Render ---
-
   if (isYoutubeMode) {
       const ytId = getYouTubeId(source.src);
       return (
@@ -302,6 +298,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         playsInline
         webkit-playsinline="true"
         crossOrigin="anonymous"
+        preload="metadata"
       />
 
       {state.buffering && !state.error && (

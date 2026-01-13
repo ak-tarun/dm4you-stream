@@ -19,7 +19,7 @@ const PORT = 4000;
 app.use(helmet({
     contentSecurityPolicy: false,
     crossOriginEmbedderPolicy: false,
-    crossOriginResourcePolicy: { policy: "cross-origin" }
+    crossOriginResourcePolicy: { policy: "cross-origin" } // CRITICAL: Allows mobile chrome to play
 }));
 
 app.use(cors({
@@ -32,12 +32,11 @@ app.use(cors({
 // Rate Limiting
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 1000, // High limit for chunked video requests
+    max: 1000, 
     message: 'Too many requests.'
 });
 app.use('/proxy', limiter);
 
-// Helper to get protocol module
 const getProtocol = (link) => link.startsWith('https') ? https : http;
 
 // 2. CORE PROXY ROUTE
@@ -47,7 +46,6 @@ app.get('/proxy', async (req, res) => {
     if (!videoUrl) return res.status(400).send('Missing URL');
 
     // -- PATH A: FFmpeg Remuxing (Transcoding) --
-    // Triggered explicitly or by file extension
     const needsTranscode = req.query.transcode === 'true' || 
                            videoUrl.match(/\.(mkv|avi|flv|wmv)$/i);
 
@@ -57,7 +55,8 @@ app.get('/proxy', async (req, res) => {
         res.writeHead(200, {
             'Content-Type': 'video/mp4',
             'Connection': 'keep-alive',
-            'Access-Control-Allow-Origin': '*'
+            'Access-Control-Allow-Origin': '*',
+            'Cross-Origin-Resource-Policy': 'cross-origin'
         });
 
         const ffmpegCommand = ffmpeg(videoUrl)
@@ -85,8 +84,6 @@ app.get('/proxy', async (req, res) => {
     }
 
     // -- PATH B: Advanced Native Proxy (Internal Redirects) --
-    // This function recursively follows redirects on the server side
-    // to prevent CORS/Protocol issues on the client.
     const proxyStream = (targetUrl, attempt = 0) => {
         if (attempt > 10) {
             console.error('❌ Too many redirects');
@@ -97,15 +94,15 @@ app.get('/proxy', async (req, res) => {
         const parsedUrl = url.parse(targetUrl);
         const protocol = getProtocol(targetUrl);
 
+        // Spoof headers to look like a browser visiting the source directly
         const headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': '*/*',
-            'Accept-Encoding': 'identity', // Important: Disable gzip for video
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+            'Accept': 'video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5',
+            'Accept-Encoding': 'identity', 
             'Connection': 'keep-alive',
-            'Referer': `${parsedUrl.protocol}//${parsedUrl.hostname}/`
+            'Referer': `${parsedUrl.protocol}//${parsedUrl.hostname}/` // Spoof referer to self
         };
 
-        // Forward Range header from client to upstream
         if (req.headers.range) {
             headers['Range'] = req.headers.range;
         }
@@ -116,7 +113,7 @@ app.get('/proxy', async (req, res) => {
             path: parsedUrl.path,
             method: 'GET',
             headers: headers,
-            rejectUnauthorized: false // Allow self-signed certs
+            rejectUnauthorized: false
         }, (proxyRes) => {
             // Handle Redirects Internally
             if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
@@ -125,30 +122,35 @@ app.get('/proxy', async (req, res) => {
                     redirectUrl = `${parsedUrl.protocol}//${parsedUrl.hostname}${redirectUrl}`;
                 }
                 console.log(`🔄 [Redirect ${attempt + 1}] -> ${redirectUrl}`);
-                // Recurse
                 proxyStream(redirectUrl, attempt + 1);
                 return;
             }
 
-            // Check for valid status
             if (!res.headersSent) {
-                // Forward specific headers to client
+                // Determine Content-Type: Fix Google's "octet-stream" to "video/mp4"
+                let contentType = proxyRes.headers['content-type'] || 'video/mp4';
+                if (contentType === 'application/octet-stream' || contentType === 'application/x-guploader-customer-content') {
+                    contentType = 'video/mp4';
+                }
+
+                // Construct Headers
                 const responseHeaders = {
-                    'Content-Type': proxyRes.headers['content-type'] || 'video/mp4',
+                    'Content-Type': contentType,
                     'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
                     'Access-Control-Allow-Headers': 'Range',
                     'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
-                    'Cache-Control': 'no-cache'
+                    'Cross-Origin-Resource-Policy': 'cross-origin', // THE FIX FOR MOBILE
+                    'Cache-Control': 'no-cache',
+                    'Accept-Ranges': 'bytes'
                 };
 
                 if (proxyRes.headers['content-length']) responseHeaders['Content-Length'] = proxyRes.headers['content-length'];
                 if (proxyRes.headers['content-range']) responseHeaders['Content-Range'] = proxyRes.headers['content-range'];
-                if (proxyRes.headers['accept-ranges']) responseHeaders['Accept-Ranges'] = proxyRes.headers['accept-ranges'];
 
                 res.writeHead(proxyRes.statusCode, responseHeaders);
             }
 
-            // Pipe data
             proxyRes.pipe(res);
             
             proxyRes.on('error', (err) => {
@@ -167,7 +169,6 @@ app.get('/proxy', async (req, res) => {
             if (!res.headersSent) res.status(504).send('Timeout');
         });
 
-        // Cleanup on client disconnect
         req.on('close', () => {
             proxyReq.destroy();
         });
@@ -182,9 +183,9 @@ app.get('/proxy', async (req, res) => {
 app.listen(PORT, () => {
     console.log(`
 ╔════════════════════════════════════════════════════════╗
-║   🛡️  StreamFlow Advanced Gateway Active               ║
+║   🛡️  StreamFlow Ultimate Gateway Active               ║
 ║   🚀  http://localhost:${PORT}                           ║
-║   ✨  Modes: Internal Redirects, FFmpeg, Range Proxy   ║
+║   ✨  Features: CORP Header, MIME Fixer, Redirects     ║
 ╚════════════════════════════════════════════════════════╝
     `);
 });

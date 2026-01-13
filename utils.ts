@@ -40,10 +40,13 @@ export const detectMimeType = (url: string): string => {
   
   // Generic containers
   if (lowerUrl.includes('.webm')) return 'video/webm';
-  if (lowerUrl.includes('.mkv')) return 'video/x-matroska'; // Will trigger transcode
-  if (lowerUrl.includes('.avi')) return 'video/x-msvideo';  // Will trigger transcode
+  if (lowerUrl.includes('.mkv')) return 'video/x-matroska'; 
+  if (lowerUrl.includes('.avi')) return 'video/x-msvideo';  
   
-  // Default to MP4 for everything else (signed URLs often lack extension)
+  // Google User Content (Drive/Photos direct links) often lack extensions but are usually MP4
+  if (lowerUrl.includes('googleusercontent.com')) return 'video/mp4';
+
+  // Default to MP4 for everything else
   return 'video/mp4'; 
 };
 
@@ -59,14 +62,14 @@ export const getFriendlyErrorMessage = (error: MediaError | null, nativeError?: 
 
   switch (error.code) {
     case MediaError.MEDIA_ERR_ABORTED:
-      return "Playback aborted by user.";
+      return "Playback aborted.";
     case MediaError.MEDIA_ERR_NETWORK:
-      return "Network error. The stream connection was lost.";
+      return "Network error. Connection lost.";
     case MediaError.MEDIA_ERR_DECODE:
-      return "The video file is corrupted or uses an unsupported codec.";
+      return "Video corrupted or unsupported.";
     case MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED:
-      return "The format is not supported by this browser or the link is expired.";
+      return "Format not supported or link expired.";
     default:
-      return "An unknown error occurred.";
+      return "Unknown error occurred.";
   }
 };
