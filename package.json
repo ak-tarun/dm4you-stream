@@ -9,9 +9,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "react": "18.3.1",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
     "lucide-react": "0.344.0",
-    "react-dom": "18.3.1",
     "hls.js": "1.5.8",
     "dashjs": "4.7.4"
   },

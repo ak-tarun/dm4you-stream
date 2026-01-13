@@ -52,12 +52,14 @@
   <script type="importmap">
 {
   "imports": {
-    "react/": "https://esm.sh/react@18.3.1/",
     "react": "https://esm.sh/react@18.3.1",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+    "react-dom": "https://esm.sh/react-dom@18.3.1",
     "lucide-react": "https://esm.sh/lucide-react@0.344.0",
-    "react-dom/": "https://esm.sh/react-dom@18.3.1/",
     "hls.js": "https://esm.sh/hls.js@1.5.8",
-    "dashjs": "https://esm.sh/dashjs@4.7.4"
+    "dashjs": "https://esm.sh/dashjs@4.7.4",
+    "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
+    "react/": "https://esm.sh/react@^19.2.3/"
   }
 }
 </script>
@@ -69,5 +71,6 @@
         <p style="margin-top: 1rem; font-family: sans-serif; font-size: 0.875rem;">Initializing StreamFlow...</p>
       </div>
     </div>
+    <script type="module" src="./index.tsx"></script>
   </body>
 </html>
