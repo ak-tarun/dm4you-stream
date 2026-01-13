@@ -19,10 +19,14 @@ export interface PlayerState {
   autoQuality: boolean;
   buffered: number;
   error: string | null;
+  isLive: boolean;
 }
 
 export interface VideoSource {
   src: string;
   type?: 'application/x-mpegURL' | 'application/dash+xml' | 'video/mp4' | string;
   title?: string;
+  headers?: Record<string, string>; // For Auth tokens, etc.
+  proxyUrl?: string; // Optional proxy endpoint
+  withCredentials?: boolean;
 }

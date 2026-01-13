@@ -33,3 +33,21 @@ export const detectMimeType = (url: string): string => {
   if (url.includes('.mpd')) return 'application/dash+xml';
   return 'video/mp4'; // Default fallback
 };
+
+export const getFriendlyErrorMessage = (error: MediaError | null, nativeError?: string): string => {
+  if (nativeError) return nativeError;
+  if (!error) return "Unknown Error";
+
+  switch (error.code) {
+    case MediaError.MEDIA_ERR_ABORTED:
+      return "The video playback was aborted.";
+    case MediaError.MEDIA_ERR_NETWORK:
+      return "A network error caused the video download to fail part-way.";
+    case MediaError.MEDIA_ERR_DECODE:
+      return "The video playback was aborted due to a corruption problem or because the video used features your browser did not support.";
+    case MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED:
+      return "The video could not be loaded, either because the server or network failed or because the format is not supported.";
+    default:
+      return "An unknown error occurred.";
+  }
+};

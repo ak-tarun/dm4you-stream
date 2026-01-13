@@ -1,13 +1,10 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { Play, Loader2, Forward, Rewind } from 'lucide-react';
+import { Play, Loader2, Forward, Rewind, AlertTriangle } from 'lucide-react';
 import ControlBar from './ControlBar';
 import { PlayerState, VideoQuality, VideoSource } from '../types';
-import { getFromStorage, saveToStorage, detectMimeType } from '../utils';
+import { getFromStorage, saveToStorage, detectMimeType, getFriendlyErrorMessage } from '../utils';
 
 // We import types only. The actual libraries are loaded dynamically.
-// Note: In a real environment with a bundler, we would keep imports and let the bundler split chunks.
-// Here, we use dynamic import() to fetch from ESM.sh only when needed.
-
 interface VideoPlayerProps {
   source: VideoSource;
   autoPlay?: boolean;
@@ -17,12 +14,13 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   
-  // Refs for library instances (using any to avoid strict type dependency without static import)
+  // Refs for library instances
   const hlsRef = useRef<any>(null);
   const dashRef = useRef<any>(null);
   
-  const clickTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastTapRef = useRef<number>(0);
+  const retryCount = useRef<number>(0);
+  const MAX_RETRIES = 3;
 
   // Constants
   const STORAGE_VOL_KEY = 'streamflow-volume';
@@ -43,6 +41,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     autoQuality: true,
     buffered: 0,
     error: null,
+    isLive: false,
   });
 
   const [qualities, setQualities] = useState<VideoQuality[]>([]);
@@ -63,9 +62,11 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         buffering: true, 
         currentTime: 0, 
         duration: 0,
-        error: null 
+        error: null,
+        isLive: false
     }));
     setQualities([]);
+    retryCount.current = 0;
 
     // Cleanup previous instances
     if (hlsRef.current) {
@@ -77,7 +78,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         dashRef.current = null;
     }
 
+    // Determine URL and headers
     const mimeType = source.type || detectMimeType(source.src);
+    const finalUrl = source.proxyUrl 
+        ? `${source.proxyUrl}?url=${encodeURIComponent(source.src)}` 
+        : source.src;
+    
     const savedTime = getFromStorage(STORAGE_TIME_KEY, 0);
 
     const initHls = async () => {
@@ -88,14 +94,25 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
           const hls = new Hls({
             enableWorker: true,
             lowLatencyMode: true,
-            backBufferLength: 90
+            backBufferLength: 90,
+            // Header injection for protected streams
+            xhrSetup: (xhr: XMLHttpRequest, url: string) => {
+                if (source.headers) {
+                    Object.entries(source.headers).forEach(([key, value]) => {
+                        xhr.setRequestHeader(key, value);
+                    });
+                }
+                if (source.withCredentials) {
+                    xhr.withCredentials = true;
+                }
+            }
           });
           hlsRef.current = hls;
 
-          hls.loadSource(source.src);
+          hls.loadSource(finalUrl);
           hls.attachMedia(video);
 
-          hls.on(Hls.Events.MANIFEST_PARSED, (event: any, data: any) => {
+          hls.on(Hls.Events.MANIFEST_PARSED as string, (event: any, data: any) => {
             const levels = data.levels.map((level: any, index: number) => ({
               height: level.height,
               bitrate: level.bitrate,
@@ -104,28 +121,37 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
             }));
             setQualities(levels);
             
-            if (savedTime > 0) video.currentTime = savedTime;
+            // Detect Live
+            if (data.levels.length > 0 && data.levels[0].details?.live) {
+                setState(s => ({ ...s, isLive: true }));
+            }
+            
+            if (savedTime > 0 && !state.isLive) video.currentTime = savedTime;
             if (autoPlay) video.play().catch(() => setState(s => ({ ...s, playing: false, muted: true }))); 
           });
 
-          hls.on(Hls.Events.ERROR, (event: any, data: any) => {
+          hls.on(Hls.Events.ERROR as string, (event: any, data: any) => {
              if (data.fatal) {
                switch (data.type) {
                  case Hls.ErrorTypes.NETWORK_ERROR:
+                   console.warn("HLS Network Error, recovering...");
                    hls.startLoad();
                    break;
                  case Hls.ErrorTypes.MEDIA_ERROR:
+                   console.warn("HLS Media Error, recovering...");
                    hls.recoverMediaError();
                    break;
                  default:
+                   console.error("HLS Fatal Error", data);
                    hls.destroy();
+                   setState(s => ({ ...s, error: "Stream error. Ensure CORS/Headers are correct." }));
                    break;
                }
              }
           });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
           // Native Safari HLS
-          video.src = source.src;
+          video.src = finalUrl;
           video.addEventListener('loadedmetadata', () => {
              if (savedTime > 0) video.currentTime = savedTime;
              if (autoPlay) video.play();
@@ -143,9 +169,25 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         
         const dash = dashjs.MediaPlayer().create();
         dashRef.current = dash;
-        dash.initialize(video, source.src, autoPlay);
         
-        dash.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => {
+        // Header injection
+        if (source.headers) {
+            dash.extend("RequestModifier", () => {
+                return {
+                    modifyRequestHeader: (xhr: XMLHttpRequest) => {
+                        Object.entries(source.headers || {}).forEach(([key, value]) => {
+                            xhr.setRequestHeader(key, value);
+                        });
+                        return xhr;
+                    },
+                    modifyRequestURL: (url: string) => url 
+                };
+            }, true);
+        }
+
+        dash.initialize(video, finalUrl, autoPlay);
+        
+        dash.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED as string, () => {
            const bitrates = dash.getBitrateInfoListFor("video");
            const levels = bitrates.map((b: any, i: number) => ({
               height: b.height,
@@ -154,8 +196,18 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
               label: `${b.height}p`
            }));
            setQualities(levels);
-           if (savedTime > 0) dash.seek(savedTime);
+           
+           const isDynamic = dash.isDynamic();
+           setState(s => ({ ...s, isLive: isDynamic }));
+
+           if (savedTime > 0 && !isDynamic) dash.seek(savedTime);
         });
+        
+        dash.on(dashjs.MediaPlayer.events.ERROR as string, (e: any) => {
+            console.error("DASH Error", e);
+            setState(s => ({...s, error: `Playback Error: ${e.error.message}`}));
+        });
+
       } catch (err) {
         console.error("Failed to load Dash.js", err);
         setState(s => ({ ...s, error: "Failed to load DASH player module" }));
@@ -168,9 +220,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
       initDash();
     } else {
       // MP4 / Native
-      video.src = source.src;
+      video.src = finalUrl;
       video.load();
-      // Ensure we listen for metadata to set time, but avoid duplicate listeners if possible
       const handleMetadata = () => {
           if (savedTime > 0) video.currentTime = savedTime;
           if (autoPlay) video.play();
@@ -182,7 +233,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
       if (hlsRef.current) hlsRef.current.destroy();
       if (dashRef.current) dashRef.current.reset();
     };
-  }, [source.src, autoPlay]);
+  }, [source.src, source.proxyUrl, source.headers, autoPlay]);
 
   // --- Event Listeners ---
 
@@ -208,7 +259,15 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     };
     
     const onDurationChange = () => setState(s => ({ ...s, duration: video.duration }));
-    const onError = () => setState(s => ({ ...s, error: video.error?.message || "Unknown error" }));
+    
+    const onError = (e: Event) => {
+        const target = e.target as HTMLVideoElement;
+        console.error("Video Error", target.error);
+        setState(s => ({ 
+            ...s, 
+            error: getFriendlyErrorMessage(target.error, "Playback prevented by browser security or format error.") 
+        }));
+    };
 
     video.addEventListener('play', onPlay);
     video.addEventListener('pause', onPause);
@@ -411,9 +470,23 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
 
       {/* Error Message */}
       {state.error && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none bg-black/80 z-20 text-white">
-          <p className="text-red-500 font-bold mb-2">Playback Error</p>
-          <p className="text-sm text-gray-300">{state.error}</p>
+        <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-auto bg-black/90 z-30 text-white p-6 text-center">
+          <AlertTriangle className="w-12 h-12 text-red-500 mb-4" />
+          <h3 className="text-xl font-bold mb-2">Playback Error</h3>
+          <p className="text-gray-300 max-w-md mb-6">{state.error}</p>
+          <div className="flex gap-4">
+            <button 
+                onClick={() => window.location.reload()} 
+                className="bg-white/10 hover:bg-white/20 px-4 py-2 rounded text-sm transition-colors"
+            >
+                Reload Page
+            </button>
+            {source.headers && (
+                <div className="text-xs text-gray-500 mt-2">
+                    Note: Custom headers are being used. Ensure CORS is configured on the server.
+                </div>
+            )}
+          </div>
         </div>
       )}
 
