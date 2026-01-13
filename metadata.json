@@ -1,0 +1,5 @@
+{
+  "name": "StreamFlow Pro",
+  "description": "A professional-grade, adaptive bitrate video player supporting HLS, DASH, and MP4 with modern UI/UX.",
+  "requestFramePermissions": []
+}
