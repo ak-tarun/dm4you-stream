@@ -1,14 +1,20 @@
 {
   "name": "streamflow-pro",
   "version": "1.0.0",
-  "description": "Professional Video Player",
+  "description": "Professional Video Player & Secure Gateway",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "server": "node server.js"
   },
   "dependencies": {
+    "cors": "^2.8.5",
     "dashjs": "^4.7.4",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.2.0",
+    "fluent-ffmpeg": "^2.1.2",
+    "helmet": "^7.1.0",
     "hls.js": "^1.5.8",
     "lucide-react": "0.344.0",
     "react": "^18.3.1",

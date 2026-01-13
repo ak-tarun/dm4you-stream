@@ -1,30 +1,40 @@
 import React, { useState } from 'react';
 import VideoPlayer from './components/VideoPlayer';
 import { VideoSource } from './types';
-import { PlayCircle, Link as LinkIcon, AlertCircle, Settings2, ShieldCheck } from 'lucide-react';
+import { PlayCircle, Link as LinkIcon, AlertCircle, Settings2, ShieldCheck, Server } from 'lucide-react';
+import { detectMimeType } from './utils';
+
+// Using local proxy to bypass CORS
+const PROXY_BASE = "http://localhost:4000/proxy";
 
 const SAMPLE_SOURCES: VideoSource[] = [
   {
     title: "Big Buck Bunny (HLS)",
     src: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
-    type: "application/x-mpegURL"
+    type: "application/x-mpegURL",
+    proxyUrl: PROXY_BASE
   },
   {
-    title: "Sintel (DASH)",
+    title: "Encrypted Widevine (DASH)",
     src: "https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd",
-    type: "application/dash+xml"
+    type: "application/dash+xml",
+    proxyUrl: PROXY_BASE,
+    drm: {
+        type: 'widevine',
+        licenseUrl: 'https://widevine-proxy.appspot.com/proxy' // Demo License Server
+    }
   },
   {
-    title: "Ocean (MP4)",
-    src: "https://vjs.zencdn.net/v/oceans.mp4",
-    type: "video/mp4"
+    title: "YouTube (IFrame API)",
+    src: "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+    type: "youtube"
   }
 ];
 
 export default function App() {
   const [currentSource, setCurrentSource] = useState<VideoSource>(SAMPLE_SOURCES[0]);
   const [inputUrl, setInputUrl] = useState('');
-  const [proxyUrl, setProxyUrl] = useState('');
+  const [useProxy, setUseProxy] = useState(true);
   const [authHeader, setAuthHeader] = useState('');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -33,7 +43,6 @@ export default function App() {
     e.preventDefault();
     if (!inputUrl.trim()) return;
 
-    // Basic validation
     try {
       new URL(inputUrl);
       
@@ -42,10 +51,17 @@ export default function App() {
         headers['Authorization'] = authHeader.trim();
       }
 
+      // Detect type
+      const detectedType = detectMimeType(inputUrl);
+      
+      // Do not use proxy for YouTube
+      const shouldProxy = useProxy && detectedType !== 'youtube';
+
       setCurrentSource({
         src: inputUrl,
         title: "Custom Stream",
-        proxyUrl: proxyUrl.trim() || undefined,
+        type: detectedType,
+        proxyUrl: shouldProxy ? PROXY_BASE : undefined,
         headers: Object.keys(headers).length > 0 ? headers : undefined,
         withCredentials: !!authHeader.trim()
       });
@@ -65,13 +81,13 @@ export default function App() {
               <PlayCircle className="w-5 h-5 text-white" />
             </div>
             <h1 className="text-xl font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white to-gray-400">
-              StreamFlow Pro
+              StreamFlow Gateway
             </h1>
           </div>
           <div className="flex items-center space-x-4">
              <div className="flex items-center text-xs text-green-500 bg-green-900/10 px-2 py-1 rounded-full border border-green-900/30">
                 <ShieldCheck className="w-3 h-3 mr-1" />
-                Secure Player
+                Secure Proxy Active
              </div>
           </div>
         </div>
@@ -87,11 +103,17 @@ export default function App() {
                 <h2 className="text-2xl font-bold text-white">{currentSource.title || "Unknown Video"}</h2>
                 <div className="flex items-center space-x-2 mt-2">
                     <span className="text-xs font-mono bg-white/10 text-gray-300 px-2 py-0.5 rounded">
-                        {currentSource.type?.split('/')[1]?.toUpperCase() || 'VIDEO'}
+                        {currentSource.type?.split('/')[1]?.toUpperCase() || currentSource.type?.toUpperCase() || 'VIDEO'}
                     </span>
                     {currentSource.proxyUrl && (
-                        <span className="text-xs font-mono bg-blue-900/30 text-blue-300 px-2 py-0.5 rounded border border-blue-800/30">
-                            PROXY ACTIVE
+                        <span className="text-xs font-mono bg-blue-900/30 text-blue-300 px-2 py-0.5 rounded border border-blue-800/30 flex items-center w-fit">
+                            <Server className="w-3 h-3 mr-1" />
+                            GATEWAY ACTIVE
+                        </span>
+                    )}
+                    {currentSource.drm && (
+                        <span className="text-xs font-mono bg-purple-900/30 text-purple-300 px-2 py-0.5 rounded border border-purple-800/30">
+                            DRM PROTECTED
                         </span>
                     )}
                 </div>
@@ -113,13 +135,24 @@ export default function App() {
                 type="text"
                 value={inputUrl}
                 onChange={(e) => setInputUrl(e.target.value)}
-                placeholder="Paste m3u8, mpd, or mp4 URL here..."
+                placeholder="Paste m3u8, mpd, mp4, or YouTube URL..."
                 className="w-full bg-black/50 border border-white/10 rounded-lg py-3 pl-10 pr-4 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-red-600 focus:border-transparent transition-all"
               />
             </div>
 
             {/* Advanced Toggle */}
-            <div className="flex justify-end">
+            <div className="flex justify-between items-center">
+                <label className="flex items-center cursor-pointer">
+                    <input 
+                        type="checkbox" 
+                        checked={useProxy} 
+                        onChange={(e) => setUseProxy(e.target.checked)}
+                        className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-red-600 relative"></div>
+                    <span className="ml-2 text-xs text-gray-400 font-medium">Use Secure Gateway (CORS Bypass)</span>
+                </label>
+
                 <button 
                     type="button"
                     onClick={() => setShowAdvanced(!showAdvanced)}
@@ -142,17 +175,6 @@ export default function App() {
                             placeholder="Bearer eyJhbG..."
                             className="w-full bg-black/50 border border-white/10 rounded px-3 py-2 text-sm text-gray-300 focus:border-red-600 outline-none"
                         />
-                    </div>
-                    <div>
-                        <label className="text-xs text-gray-500 uppercase font-semibold mb-1 block">Proxy URL</label>
-                        <input
-                            type="text"
-                            value={proxyUrl}
-                            onChange={(e) => setProxyUrl(e.target.value)}
-                            placeholder="https://my-proxy.com/fetch"
-                            className="w-full bg-black/50 border border-white/10 rounded px-3 py-2 text-sm text-gray-300 focus:border-red-600 outline-none"
-                        />
-                        <p className="text-[10px] text-gray-600 mt-1">Appends ?url= to this endpoint</p>
                     </div>
                 </div>
             )}
@@ -199,11 +221,11 @@ export default function App() {
 
       <footer className="border-t border-white/10 bg-black py-8 mt-12">
         <div className="max-w-7xl mx-auto px-4 text-center text-gray-600 text-sm">
-          <p>StreamFlow Pro Enterprise Player &copy; {new Date().getFullYear()}</p>
+          <p>StreamFlow Gateway &copy; {new Date().getFullYear()}</p>
           <div className="flex justify-center space-x-4 mt-2 text-xs text-gray-700">
-             <span>HLS.js</span>
+             <span>Secure Proxy</span>
              <span>•</span>
-             <span>Dash.js</span>
+             <span>FFmpeg Transcoding</span>
              <span>•</span>
              <span>AES-128 Ready</span>
           </div>

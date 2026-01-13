@@ -31,7 +31,14 @@ export const getFromStorage = <T>(key: string, defaultValue: T): T => {
 export const detectMimeType = (url: string): string => {
   if (url.includes('.m3u8')) return 'application/x-mpegURL';
   if (url.includes('.mpd')) return 'application/dash+xml';
+  if (url.includes('youtube.com') || url.includes('youtu.be')) return 'youtube';
   return 'video/mp4'; // Default fallback
+};
+
+export const getYouTubeId = (url: string): string | null => {
+    const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/;
+    const match = url.match(regExp);
+    return (match && match[2].length === 11) ? match[2] : null;
 };
 
 export const getFriendlyErrorMessage = (error: MediaError | null, nativeError?: string): string => {

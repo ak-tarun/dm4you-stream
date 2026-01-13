@@ -2,9 +2,8 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { Play, Loader2, Forward, Rewind, AlertTriangle } from 'lucide-react';
 import ControlBar from './ControlBar';
 import { PlayerState, VideoQuality, VideoSource } from '../types';
-import { getFromStorage, saveToStorage, detectMimeType, getFriendlyErrorMessage } from '../utils';
+import { getFromStorage, saveToStorage, detectMimeType, getFriendlyErrorMessage, getYouTubeId } from '../utils';
 
-// We import types only. The actual libraries are loaded dynamically.
 interface VideoPlayerProps {
   source: VideoSource;
   autoPlay?: boolean;
@@ -20,7 +19,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
   
   const lastTapRef = useRef<number>(0);
   const retryCount = useRef<number>(0);
-  const MAX_RETRIES = 3;
 
   // Constants
   const STORAGE_VOL_KEY = 'streamflow-volume';
@@ -48,14 +46,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
   const [showControls, setShowControls] = useState(true);
   const [controlTimeout, setControlTimeout] = useState<ReturnType<typeof setTimeout> | null>(null);
   const [doubleTapAction, setDoubleTapAction] = useState<'forward' | 'rewind' | null>(null);
+  const [isYoutubeMode, setIsYoutubeMode] = useState(false);
 
   // --- Initialization & Source Handling ---
 
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    // Reset State for new source
+    // Reset State
     setState(prev => ({ 
         ...prev, 
         playing: autoPlay, 
@@ -66,7 +62,19 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         isLive: false
     }));
     setQualities([]);
-    retryCount.current = 0;
+    setIsYoutubeMode(false);
+    
+    const mimeType = source.type || detectMimeType(source.src);
+
+    // YouTube Handling (IFrame Mode)
+    if (mimeType === 'youtube') {
+        setIsYoutubeMode(true);
+        setState(prev => ({ ...prev, buffering: false }));
+        return; // Stop standard initialization
+    }
+
+    const video = videoRef.current;
+    if (!video) return;
 
     // Cleanup previous instances
     if (hlsRef.current) {
@@ -78,8 +86,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         dashRef.current = null;
     }
 
-    // Determine URL and headers
-    const mimeType = source.type || detectMimeType(source.src);
+    // Determine Final URL (Apply Proxy if set)
     const finalUrl = source.proxyUrl 
         ? `${source.proxyUrl}?url=${encodeURIComponent(source.src)}` 
         : source.src;
@@ -95,7 +102,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
             enableWorker: true,
             lowLatencyMode: true,
             backBufferLength: 90,
-            // Header injection for protected streams
             xhrSetup: (xhr: XMLHttpRequest, url: string) => {
                 if (source.headers) {
                     Object.entries(source.headers).forEach(([key, value]) => {
@@ -112,7 +118,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
           hls.loadSource(finalUrl);
           hls.attachMedia(video);
 
-          hls.on(Hls.Events.MANIFEST_PARSED as string, (event: any, data: any) => {
+          hls.on(Hls.Events.MANIFEST_PARSED, (event: any, data: any) => {
             const levels = data.levels.map((level: any, index: number) => ({
               height: level.height,
               bitrate: level.bitrate,
@@ -121,7 +127,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
             }));
             setQualities(levels);
             
-            // Detect Live
             if (data.levels.length > 0 && data.levels[0].details?.live) {
                 setState(s => ({ ...s, isLive: true }));
             }
@@ -130,19 +135,16 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
             if (autoPlay) video.play().catch(() => setState(s => ({ ...s, playing: false, muted: true }))); 
           });
 
-          hls.on(Hls.Events.ERROR as string, (event: any, data: any) => {
+          hls.on(Hls.Events.ERROR, (event: any, data: any) => {
              if (data.fatal) {
                switch (data.type) {
                  case Hls.ErrorTypes.NETWORK_ERROR:
-                   console.warn("HLS Network Error, recovering...");
                    hls.startLoad();
                    break;
                  case Hls.ErrorTypes.MEDIA_ERROR:
-                   console.warn("HLS Media Error, recovering...");
                    hls.recoverMediaError();
                    break;
                  default:
-                   console.error("HLS Fatal Error", data);
                    hls.destroy();
                    setState(s => ({ ...s, error: "Stream error. Ensure CORS/Headers are correct." }));
                    break;
@@ -150,7 +152,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
              }
           });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-          // Native Safari HLS
           video.src = finalUrl;
           video.addEventListener('loadedmetadata', () => {
              if (savedTime > 0) video.currentTime = savedTime;
@@ -158,7 +159,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
           }, { once: true });
         }
       } catch (err) {
-        console.error("Failed to load HLS.js", err);
         setState(s => ({ ...s, error: "Failed to load HLS player module" }));
       }
     };
@@ -185,10 +185,26 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
             }, true);
         }
 
+        // DRM Configuration
+        if (source.drm) {
+            const protectionData: any = {};
+            if (source.drm.type === 'widevine') {
+                protectionData['com.widevine.alpha'] = {
+                    serverURL: source.drm.licenseUrl,
+                    httpRequestHeaders: source.drm.headers
+                };
+            } else if (source.drm.type === 'clearkey') {
+                 protectionData['org.w3.clearkey'] = {
+                    serverURL: source.drm.licenseUrl
+                };
+            }
+            dash.setProtectionData(protectionData);
+        }
+
         dash.initialize(video, finalUrl, autoPlay);
         
         dash.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED as string, () => {
-           const bitrates = dash.getBitrateInfoListFor("video");
+           const bitrates = (dash as any).getBitrateInfoListFor("video");
            const levels = bitrates.map((b: any, i: number) => ({
               height: b.height,
               bitrate: b.bitrate,
@@ -204,12 +220,10 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         });
         
         dash.on(dashjs.MediaPlayer.events.ERROR as string, (e: any) => {
-            console.error("DASH Error", e);
             setState(s => ({...s, error: `Playback Error: ${e.error.message}`}));
         });
 
       } catch (err) {
-        console.error("Failed to load Dash.js", err);
         setState(s => ({ ...s, error: "Failed to load DASH player module" }));
       }
     };
@@ -233,13 +247,13 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
       if (hlsRef.current) hlsRef.current.destroy();
       if (dashRef.current) dashRef.current.reset();
     };
-  }, [source.src, source.proxyUrl, source.headers, autoPlay]);
+  }, [source.src, source.proxyUrl, source.headers, autoPlay, source.drm]);
 
   // --- Event Listeners ---
 
   useEffect(() => {
     const video = videoRef.current;
-    if (!video) return;
+    if (!video || isYoutubeMode) return;
 
     const onPlay = () => setState(s => ({ ...s, playing: true, buffering: false }));
     const onPause = () => setState(s => ({ ...s, playing: false }));
@@ -262,10 +276,9 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     
     const onError = (e: Event) => {
         const target = e.target as HTMLVideoElement;
-        console.error("Video Error", target.error);
         setState(s => ({ 
             ...s, 
-            error: getFriendlyErrorMessage(target.error, "Playback prevented by browser security or format error.") 
+            error: getFriendlyErrorMessage(target.error, "Playback prevented. Try using the secure gateway.") 
         }));
     };
 
@@ -286,11 +299,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
       video.removeEventListener('durationchange', onDurationChange);
       video.removeEventListener('error', onError);
     };
-  }, [source.src]);
+  }, [source.src, isYoutubeMode]);
 
   // --- Control Handlers ---
 
   const togglePlay = useCallback(() => {
+    if (isYoutubeMode) return; // YouTube iframe handles its own controls
     const video = videoRef.current;
     if (!video) return;
     if (video.paused) {
@@ -298,23 +312,23 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     } else {
       video.pause();
     }
-  }, []);
+  }, [isYoutubeMode]);
 
   const seek = useCallback((time: number) => {
+    if (isYoutubeMode) return;
     const video = videoRef.current;
     if (!video) return;
     video.currentTime = Math.min(Math.max(0, time), video.duration);
-  }, []);
+  }, [isYoutubeMode]);
 
   const skip = useCallback((amount: number) => {
+     if (isYoutubeMode) return;
      const video = videoRef.current;
      if (!video) return;
      seek(video.currentTime + amount);
-     
-     // Animation trigger
      setDoubleTapAction(amount > 0 ? 'forward' : 'rewind');
      setTimeout(() => setDoubleTapAction(null), 500);
-  }, [seek]);
+  }, [seek, isYoutubeMode]);
 
   const changeVolume = useCallback((vol: number) => {
     const video = videoRef.current;
@@ -330,7 +344,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     if (!video) return;
     const newMuted = !video.muted;
     video.muted = newMuted;
-    // If unmuting and volume is 0, set to default 0.5
     if (!newMuted && video.volume === 0) {
         video.volume = 0.5;
         setState(s => ({ ...s, volume: 0.5 }));
@@ -352,7 +365,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
   const togglePip = useCallback(async () => {
     const video = videoRef.current;
     if (!video) return;
-    
     if (document.pictureInPictureElement) {
       await document.exitPictureInPicture();
       setState(s => ({ ...s, pip: false }));
@@ -385,38 +397,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
 
   // --- Interaction Observers ---
 
-  // Keyboard Shortcuts
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Ignore if user is typing in an input
-      if ((e.target as HTMLElement).tagName === 'INPUT') return;
-
-      switch(e.key.toLowerCase()) {
-        case ' ':
-        case 'k':
-          e.preventDefault();
-          togglePlay();
-          break;
-        case 'arrowright':
-        case 'l':
-          skip(10);
-          break;
-        case 'arrowleft':
-        case 'j':
-          skip(-10);
-          break;
-        case 'f':
-          toggleFullScreen();
-          break;
-        case 'm':
-          toggleMute();
-          break;
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [togglePlay, skip, toggleFullScreen, toggleMute]);
-
   // Mouse Move / Hide Controls
   const handleMouseMove = () => {
     setShowControls(true);
@@ -429,6 +409,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
   
   // Mobile double-tap zones logic
   const handleZoneClick = (side: 'left' | 'right') => (e: React.MouseEvent) => {
+      if (isYoutubeMode) return;
       e.stopPropagation();
       e.preventDefault();
       
@@ -436,15 +417,32 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
       const DOUBLE_TAP_DELAY = 300;
       
       if (now - lastTapRef.current < DOUBLE_TAP_DELAY) {
-          // Double Tap Detected
           skip(side === 'left' ? -10 : 10);
-          lastTapRef.current = 0; // Reset
+          lastTapRef.current = 0; 
       } else {
-          // Single Tap - Just toggle controls/play
           lastTapRef.current = now;
           togglePlay();
       }
   };
+
+  if (isYoutubeMode) {
+      const ytId = getYouTubeId(source.src);
+      return (
+          <div ref={containerRef} className="relative w-full aspect-video bg-black rounded-xl overflow-hidden shadow-2xl">
+              {ytId ? (
+                <iframe
+                    src={`https://www.youtube.com/embed/${ytId}?autoplay=${autoPlay ? 1 : 0}&controls=1&modestbranding=1&rel=0`}
+                    title="YouTube video player"
+                    className="w-full h-full"
+                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                    allowFullScreen
+                />
+              ) : (
+                  <div className="flex items-center justify-center h-full text-white">Invalid YouTube URL</div>
+              )}
+          </div>
+      );
+  }
 
   return (
     <div 
@@ -472,20 +470,15 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
       {state.error && (
         <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-auto bg-black/90 z-30 text-white p-6 text-center">
           <AlertTriangle className="w-12 h-12 text-red-500 mb-4" />
-          <h3 className="text-xl font-bold mb-2">Playback Error</h3>
+          <h3 className="text-xl font-bold mb-2">Stream Error</h3>
           <p className="text-gray-300 max-w-md mb-6">{state.error}</p>
           <div className="flex gap-4">
             <button 
                 onClick={() => window.location.reload()} 
                 className="bg-white/10 hover:bg-white/20 px-4 py-2 rounded text-sm transition-colors"
             >
-                Reload Page
+                Retry Playback
             </button>
-            {source.headers && (
-                <div className="text-xs text-gray-500 mt-2">
-                    Note: Custom headers are being used. Ensure CORS is configured on the server.
-                </div>
-            )}
           </div>
         </div>
       )}

@@ -22,11 +22,22 @@ export interface PlayerState {
   isLive: boolean;
 }
 
+export interface DrmConfig {
+  serverURL: string;
+  header?: Record<string, string>;
+}
+
 export interface VideoSource {
   src: string;
-  type?: 'application/x-mpegURL' | 'application/dash+xml' | 'video/mp4' | string;
+  type?: 'application/x-mpegURL' | 'application/dash+xml' | 'video/mp4' | 'youtube' | string;
   title?: string;
   headers?: Record<string, string>; // For Auth tokens, etc.
   proxyUrl?: string; // Optional proxy endpoint
   withCredentials?: boolean;
+  // DRM Configuration
+  drm?: {
+    type: 'widevine' | 'playready' | 'clearkey';
+    licenseUrl: string;
+    headers?: Record<string, string>;
+  };
 }
