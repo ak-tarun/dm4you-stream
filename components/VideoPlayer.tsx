@@ -1,10 +1,12 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import Hls from 'hls.js';
-import dashjs from 'dashjs';
 import { Play, Loader2, Forward, Rewind } from 'lucide-react';
 import ControlBar from './ControlBar';
 import { PlayerState, VideoQuality, VideoSource } from '../types';
 import { getFromStorage, saveToStorage, detectMimeType } from '../utils';
+
+// We import types only. The actual libraries are loaded dynamically.
+// Note: In a real environment with a bundler, we would keep imports and let the bundler split chunks.
+// Here, we use dynamic import() to fetch from ESM.sh only when needed.
 
 interface VideoPlayerProps {
   source: VideoSource;
@@ -14,8 +16,11 @@ interface VideoPlayerProps {
 const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const hlsRef = useRef<Hls | null>(null);
-  const dashRef = useRef<dashjs.MediaPlayerClass | null>(null);
+  
+  // Refs for library instances (using any to avoid strict type dependency without static import)
+  const hlsRef = useRef<any>(null);
+  const dashRef = useRef<any>(null);
+  
   const clickTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastTapRef = useRef<number>(0);
 
@@ -56,82 +61,105 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         ...prev, 
         playing: autoPlay, 
         buffering: true, 
-        currentTime: 0,
+        currentTime: 0, 
+        duration: 0,
         error: null 
     }));
     setQualities([]);
 
+    // Cleanup previous instances
+    if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+    }
+    if (dashRef.current) {
+        dashRef.current.reset();
+        dashRef.current = null;
+    }
+
     const mimeType = source.type || detectMimeType(source.src);
     const savedTime = getFromStorage(STORAGE_TIME_KEY, 0);
 
-    const initHls = () => {
-      if (Hls.isSupported()) {
-        if (hlsRef.current) hlsRef.current.destroy();
-        const hls = new Hls({
-          enableWorker: true,
-          lowLatencyMode: true,
-          backBufferLength: 90
-        });
-        hlsRef.current = hls;
+    const initHls = async () => {
+      try {
+        const { default: Hls } = await import('hls.js');
+        
+        if (Hls.isSupported()) {
+          const hls = new Hls({
+            enableWorker: true,
+            lowLatencyMode: true,
+            backBufferLength: 90
+          });
+          hlsRef.current = hls;
 
-        hls.loadSource(source.src);
-        hls.attachMedia(video);
+          hls.loadSource(source.src);
+          hls.attachMedia(video);
 
-        hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
-          const levels = data.levels.map((level, index) => ({
-            height: level.height,
-            bitrate: level.bitrate,
-            index: index,
-            label: level.height ? `${level.height}p` : 'Auto'
-          }));
-          setQualities(levels);
-          
-          if (savedTime > 0) video.currentTime = savedTime;
-          if (autoPlay) video.play().catch(() => setState(s => ({ ...s, playing: false, muted: true }))); 
-        });
+          hls.on(Hls.Events.MANIFEST_PARSED, (event: any, data: any) => {
+            const levels = data.levels.map((level: any, index: number) => ({
+              height: level.height,
+              bitrate: level.bitrate,
+              index: index,
+              label: level.height ? `${level.height}p` : 'Auto'
+            }));
+            setQualities(levels);
+            
+            if (savedTime > 0) video.currentTime = savedTime;
+            if (autoPlay) video.play().catch(() => setState(s => ({ ...s, playing: false, muted: true }))); 
+          });
 
-        hls.on(Hls.Events.ERROR, (event, data) => {
-           if (data.fatal) {
-             switch (data.type) {
-               case Hls.ErrorTypes.NETWORK_ERROR:
-                 hls.startLoad();
-                 break;
-               case Hls.ErrorTypes.MEDIA_ERROR:
-                 hls.recoverMediaError();
-                 break;
-               default:
-                 hls.destroy();
-                 break;
+          hls.on(Hls.Events.ERROR, (event: any, data: any) => {
+             if (data.fatal) {
+               switch (data.type) {
+                 case Hls.ErrorTypes.NETWORK_ERROR:
+                   hls.startLoad();
+                   break;
+                 case Hls.ErrorTypes.MEDIA_ERROR:
+                   hls.recoverMediaError();
+                   break;
+                 default:
+                   hls.destroy();
+                   break;
+               }
              }
-           }
-        });
-      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        // Native Safari HLS
-        video.src = source.src;
-        video.addEventListener('loadedmetadata', () => {
-           if (savedTime > 0) video.currentTime = savedTime;
-           if (autoPlay) video.play();
-        });
+          });
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          // Native Safari HLS
+          video.src = source.src;
+          video.addEventListener('loadedmetadata', () => {
+             if (savedTime > 0) video.currentTime = savedTime;
+             if (autoPlay) video.play();
+          }, { once: true });
+        }
+      } catch (err) {
+        console.error("Failed to load HLS.js", err);
+        setState(s => ({ ...s, error: "Failed to load HLS player module" }));
       }
     };
 
-    const initDash = () => {
-      if (dashRef.current) dashRef.current.reset();
-      const dash = dashjs.MediaPlayer().create();
-      dashRef.current = dash;
-      dash.initialize(video, source.src, autoPlay);
-      
-      dash.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => {
-         const bitrates = dash.getBitrateInfoListFor("video");
-         const levels = bitrates.map((b, i) => ({
-            height: b.height,
-            bitrate: b.bitrate,
-            index: i,
-            label: `${b.height}p`
-         }));
-         setQualities(levels);
-         if (savedTime > 0) dash.seek(savedTime);
-      });
+    const initDash = async () => {
+      try {
+        const { default: dashjs } = await import('dashjs');
+        
+        const dash = dashjs.MediaPlayer().create();
+        dashRef.current = dash;
+        dash.initialize(video, source.src, autoPlay);
+        
+        dash.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => {
+           const bitrates = dash.getBitrateInfoListFor("video");
+           const levels = bitrates.map((b: any, i: number) => ({
+              height: b.height,
+              bitrate: b.bitrate,
+              index: i,
+              label: `${b.height}p`
+           }));
+           setQualities(levels);
+           if (savedTime > 0) dash.seek(savedTime);
+        });
+      } catch (err) {
+        console.error("Failed to load Dash.js", err);
+        setState(s => ({ ...s, error: "Failed to load DASH player module" }));
+      }
     };
 
     if (mimeType === 'application/x-mpegURL') {
@@ -142,8 +170,12 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
       // MP4 / Native
       video.src = source.src;
       video.load();
-      if (savedTime > 0) video.currentTime = savedTime;
-      if (autoPlay) video.play();
+      // Ensure we listen for metadata to set time, but avoid duplicate listeners if possible
+      const handleMetadata = () => {
+          if (savedTime > 0) video.currentTime = savedTime;
+          if (autoPlay) video.play();
+      };
+      video.addEventListener('loadedmetadata', handleMetadata, { once: true });
     }
 
     return () => {
@@ -284,7 +316,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
     if (hlsRef.current) {
       hlsRef.current.currentLevel = index;
     } else if (dashRef.current) {
-        // Dash.js quality switching logic (simplified)
         const cfg = { 'video': { 'abr': { 'autoSwitchBitrate': { 'video': index === -1 } } } };
         dashRef.current.updateSettings(cfg);
         if (index !== -1) {
@@ -378,8 +409,16 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ source, autoPlay = false }) =
         </div>
       )}
 
+      {/* Error Message */}
+      {state.error && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none bg-black/80 z-20 text-white">
+          <p className="text-red-500 font-bold mb-2">Playback Error</p>
+          <p className="text-sm text-gray-300">{state.error}</p>
+        </div>
+      )}
+
       {/* Big Play Button (Initial or Paused) */}
-      {!state.playing && !state.buffering && (
+      {!state.playing && !state.buffering && !state.error && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none bg-black/10 z-10">
            <div className="w-20 h-20 bg-red-600/90 rounded-full flex items-center justify-center pl-2 shadow-lg scale-100 transition-transform hover:scale-110">
               <Play className="w-10 h-10 text-white fill-white" />
